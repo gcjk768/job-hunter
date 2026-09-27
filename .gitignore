@@ -1,0 +1,22 @@
+# WHITELIST. This folder is a live job search; only the engineering is public.
+# Everything is ignored unless named below: resume content, personal filters, the vault,
+# generated .docx, reports, state files and .env never reach git.
+/*
+!/.gitignore
+!/README.md
+!/build/
+!/deploy/
+
+/build/*
+!/build/nas_agent.py
+!/build/build_docs.py
+!/build/weekly_sweep.py
+!/build/job_sources.py
+!/build/selftest.py
+!/build/content_example.py
+!/build/my_profile_example.py
+
+/deploy/*
+!/deploy/nas/
+/deploy/nas/*
+!/deploy/nas/compose.yaml

@@ -1,0 +1,32 @@
+# Job watcher on the UGREEN NAS — UGOS Docker project `job-hunter`, share docker/job-hunter.
+# Sweeps every SWEEP_INTERVAL_HOURS, judges new postings with Ollama Cloud through the
+# trading-desk's signed-in Ollama container (the Pro subscription lives in its .ollama key),
+# drafts resume + cover letter into ./tailored-auto/, and posts to Telegram. Never applies.
+#
+# Share layout:  compose.yaml  .env  build/*.py   (tailored-auto/ and build/.nas_state.json appear on first run)
+services:
+  job-hunter:
+    image: python:3.12-slim
+    container_name: job-hunter
+    restart: unless-stopped
+    working_dir: /app
+    env_file:                          # TELEGRAM_BOT_TOKEN / _CHAT_ID / _THREAD_ID; never commit it
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Singapore
+      PYTHONUNBUFFERED: "1"
+      OLLAMA_BASE_URL: http://trading-ollama:11434
+      JOB_MODEL: deepseek-v4.1-flash:cloud   # the model the desk benchmarked for valid JSON
+      SWEEP_INTERVAL_HOURS: "6"
+      MAX_PER_CYCLE: "8"               # caps cloud spend per cycle
+      FIT_THRESHOLD: "70"
+    volumes:
+      - ./:/app
+    networks: [desk]
+    command: ["sh", "-c", "pip install -q --no-cache-dir python-docx && exec python -u build/nas_agent.py"]
+
+networks:
+  desk:                                # the trading-desk project's default network, where trading-ollama lives
+    external: true
+    name: trading-desk_default
