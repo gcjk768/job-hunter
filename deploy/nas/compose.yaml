@@ -1,12 +1,26 @@
 # Job watcher on the UGREEN NAS — UGOS Docker project `job-hunter`, share docker/job-hunter.
-# Sweeps every SWEEP_INTERVAL_HOURS, judges new postings with Ollama Cloud through the
-# trading-desk's signed-in Ollama container (the Pro subscription lives in its .ollama key),
-# drafts resume + cover letter into ./tailored-auto/, and posts to Telegram. Never applies.
+# Sweeps every hour, 24/7; judges new postings with `claude -p`; drafts resume + cover letter into
+# ./tailored-auto/; sends FAANG/MANGOES fits to Telegram at once and a daily digest at 18:00 SGT. Never applies.
 #
-# Share layout:  compose.yaml  .env  build/*.py   (tailored-auto/ and build/.nas_state.json appear on first run)
+# Code comes from the PC: Syncthing already mirrors the PC Desktop (send-only) to the NAS home folder, so
+# Resume/build is mounted read-only from there and the agent re-execs itself when a .py file changes.
+# Job notes go into docs/vault/Job Watcher — docs/vault is the PC project vault, synced both ways.
+#
+# Claude CLI is set up like the trading desk: installed once under $HOME (/app/.home, on the share, so it
+# survives restarts). First time only, in the job-hunter container's Terminal: `claude`, then /login.
+#
+# Share layout:  compose.yaml  .env  state/  docs/vault/  (.home/, tailored-auto/ appear on first run)
 services:
   job-hunter:
-    image: python:3.12-slim
+    # Baked once on deploy so a restart takes seconds: python-docx, Playwright + Chromium (Apple careers).
+    # The Claude CLI stays under $HOME on the share, where its login lives.
+    build:
+      context: ./state                 # tiny dir: the Dockerfile needs no files, and "." would ship .home/ (~200 MB) to the builder
+      dockerfile_inline: |
+        FROM python:3.12
+        ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+        RUN pip install --no-cache-dir python-docx playwright && python -m playwright install --with-deps chromium
+    image: job-hunter:local
     container_name: job-hunter
     restart: unless-stopped
     working_dir: /app
@@ -16,17 +30,17 @@ services:
     environment:
       TZ: Asia/Singapore
       PYTHONUNBUFFERED: "1"
-      OLLAMA_BASE_URL: http://trading-ollama:11434
-      JOB_MODEL: deepseek-v4.1-flash:cloud   # the model the desk benchmarked for valid JSON
-      SWEEP_INTERVAL_HOURS: "6"
-      MAX_PER_CYCLE: "8"               # caps cloud spend per cycle
+      PYTHONDONTWRITEBYTECODE: "1"     # build/ is read-only
+      HOME: /app/.home                 # Claude CLI + login survive restarts
+      PATH: /app/.home/.local/bin:/usr/local/bin:/usr/bin:/bin
+      JOB_STATE: /app/state/.nas_state.json
+      JOB_VAULT: /app/docs/vault/Job Watcher
+      JOB_MODEL: sonnet
+      SWEEP_INTERVAL_HOURS: "1"
+      DIGEST_HOUR: "18"
+      MAX_PER_CYCLE: "8"               # judge calls per sweep; the rest roll into the next hour
       FIT_THRESHOLD: "70"
     volumes:
       - ./:/app
-    networks: [desk]
-    command: ["sh", "-c", "pip install -q --no-cache-dir python-docx && exec python -u build/nas_agent.py"]
-
-networks:
-  desk:                                # the trading-desk project's default network, where trading-ollama lives
-    external: true
-    name: trading-desk_default
+      - "/volume1/@home/James Koh/Desktop/Claude Code Project/Resume/build:/app/build:ro"
+    command: ["sh", "-c", "mkdir -p $$HOME /app/state && (command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash) && exec python -u build/nas_agent.py"]
