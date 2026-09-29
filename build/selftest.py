@@ -49,6 +49,58 @@ CASES = [
 ]
 
 
+def nas_watcher() -> str:
+    """One stubbed NAS cycle: the model, Telegram, the sweep and the doc builder are fakes, so this
+    runs offline in a temp dir. Returns "" when every behaviour holds, else what broke."""
+    import datetime as dt
+    import tempfile
+
+    import nas_agent as a
+
+    tmp = Path(tempfile.mkdtemp())
+    a.VAULT, a.STATE, a.SKIP_FILE = tmp / "vault", tmp / "state.json", tmp / "skip.txt"
+    a.SKIP_FILE.write_text("10525204  # AWS SGP, rejected\n", encoding="utf-8")
+    sent, judged = [], []
+    a.telegram, a.build = sent.append, (lambda r, v: tmp / "docs")
+    today, old = str(dt.date.today()), "2020-01-01"
+    job = lambda i, t, c, posted=today: {"id": i, "title": t, "company": c, "url": f"u/{i}",  # noqa: E731
+                                         "lo": None, "posted": posted, "desc": "x"}
+    first = [job("1", "Senior SRE", "NVIDIA"), job("2", "Old Role", "Acme", old)]
+    later = first + [job("3", "Senior SRE ", "nvidia"),                       # repost of 1
+                     job("amazon.jobs/10525204", "Solutions Architect", "Amazon"),  # on skip list
+                     job("5", "DevOps Engineer", "Beta Pte")]
+    a.judge = lambda r: judged.append(r["id"]) or {"suitable": True, "score": 80, "letter": ["x"],
+                                                   "reason": "r", "gaps": "g"}
+    state = {"seen": {}}
+    a.candidates = lambda: first
+    a.cycle(state)
+    if judged != ["1"]:
+        return f"first run should judge only the recent posting, judged {judged}"
+    a.candidates = lambda: later
+    a.cycle(state)
+    if judged != ["1", "5"]:
+        return f"repost/skip-list leaked into judging: {judged}"
+    if state["seen"]["3"].get("dup_of") != "1" or not state["seen"]["amazon.jobs/10525204"].get("skip"):
+        return "repost or skip not recorded"
+    if sum("Tier-1" in m for m in sent) != 1:
+        return f"expected exactly one tier-1 alert, got {len(sent)} messages"
+    notes = sorted(p.name for p in (a.VAULT / "Jobs").iterdir())
+    if len(notes) != 2 or not all(n.startswith(today) for n in notes):
+        return f"vault notes wrong: {notes}"
+    a.judge = lambda r: (_ for _ in ()).throw(RuntimeError("401 login expired"))
+    a.candidates = lambda: later + [job(str(i), f"Role {i}", "Gamma") for i in range(10, 14)]
+    a.cycle(state)
+    if sum("failed in a row" in m for m in sent) != 1:
+        return "no single failure alert after repeated judge errors"
+    a.digest(state)
+    if not (a.VAULT / "Daily" / f"{today}.md").exists():
+        return "daily digest note missing"
+    return ""
+
+
+CASES.append(("NAS watcher: baseline, reposts, skip list, alerts, vault", lambda: nas_watcher() == "", True))
+
+
 def main() -> int:
     failures = []
 

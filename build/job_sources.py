@@ -26,6 +26,7 @@ loads normally with no bot check to defeat.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import urllib.error
@@ -141,6 +142,10 @@ def _rec(title, company, url, posted="", source="", years=None) -> dict:
         "industry": INDUSTRY.get(company.lower().strip(), ""),
         "ssic": None,
         "public_sector": False,
+        # Job text for the NAS fit judge: inline where the list call already returns it, otherwise
+        # "jd_api" is the detail endpoint to fetch it from. Neither is written to any state file.
+        "desc": "",
+        "jd_api": None,
     }
 
 
@@ -148,7 +153,7 @@ def greenhouse(keep: re.Pattern, log=print) -> list[dict]:
     out, missing = [], []
     for slug in GREENHOUSE:
         try:
-            data = _get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs")
+            data = _get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true")
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 missing.append(slug)
@@ -162,7 +167,7 @@ def greenhouse(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["title"], slug.title(), job.get("absolute_url", ""),
                        job.get("updated_at", ""), "Greenhouse")
-            rec.update(remote=remote, where=loc)
+            rec.update(remote=remote, where=loc, desc=html.unescape(job.get("content") or ""))
             out.append(rec)
     if missing:
         log(f"  (greenhouse slug not found, skipped: {', '.join(missing)})")
@@ -182,7 +187,8 @@ def ashby(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["title"], slug.title(), job.get("jobUrl", ""),
                        job.get("publishedAt", ""), "Ashby")
-            rec.update(remote=remote, where=job.get("location"))
+            rec.update(remote=remote, where=job.get("location"),
+                       desc=job.get("descriptionPlain") or job.get("descriptionHtml") or "")
             out.append(rec)
     return out
 
@@ -201,7 +207,9 @@ def lever(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["text"], slug.replace("-", " ").title(), job.get("hostedUrl", ""),
                        "", "Lever")
-            rec.update(remote=remote, where=loc)
+            lists = "\n".join(f"{x.get('text', '')}: {x.get('content', '')}" for x in job.get("lists") or [])
+            rec.update(remote=remote, where=loc,
+                       desc=f"{job.get('descriptionPlain', '')}\n{lists}\n{job.get('additionalPlain', '')}")
             out.append(rec)
     return out
 
@@ -231,6 +239,8 @@ def amazon(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             url = "https://www.amazon.jobs" + (job.get("job_path") or "")
             rec = _rec(job["title"], "Amazon / AWS", url, job.get("posted_date", ""), "amazon.jobs")
+            rec["desc"] = "\n\n".join(job.get(k) or "" for k in
+                                      ("description", "basic_qualifications", "preferred_qualifications"))
             if rec["id"] not in {o["id"] for o in out}:
                 out.append(rec)
     return out
@@ -267,6 +277,7 @@ def workday(keep: re.Pattern, log=print) -> list[dict]:
                     link = f"https://{host}.{wd}.myworkdayjobs.com/en-US/{site}{path}"
                     rec = _rec(job["title"], host.title(), link,
                                job.get("postedOn", ""), "Workday")
+                    rec["jd_api"] = f"https://{host}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{path}"
                     if rec["id"] not in {o["id"] for o in out}:
                         out.append(rec)
     return out
@@ -306,7 +317,8 @@ def nvidia(keep: re.Pattern, log=print) -> list[dict]:
             rec = _rec(title, "NVIDIA", link, "", "NVIDIA (Workday)")
             # postedOn is relative text ("Posted 23 Days Ago"), not a date — keep it as the note
             # rather than pretending it parses.
-            rec.update(where=job.get("locationsText"), posted=str(job.get("postedOn") or "")[:24])
+            rec.update(where=job.get("locationsText"), posted=str(job.get("postedOn") or "")[:24],
+                       jd_api=f"{NVIDIA_HOST}/wday/cxs/nvidia/{NVIDIA_SITE}{path}")
             out.setdefault(rec["id"], rec)
     return list(out.values())
 
@@ -314,8 +326,8 @@ def nvidia(keep: re.Pattern, log=print) -> list[dict]:
 def apple(keep: re.Pattern, log=print) -> list[dict]:
     """Apple Singapore. No usable API — jobs.apple.com/api/v1/search rejects unauthenticated
     POSTs (HTTP 436) and the GET variant returns 401 — so this drives Playwright against the
-    public search page instead. Uses the installed Chrome; Playwright cannot download its own
-    browser on this machine."""
+    public search page instead. Uses the installed Chrome (Playwright cannot download its own
+    browser on the PC); falls back to Playwright's Chromium where there is no Chrome."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -325,7 +337,10 @@ def apple(keep: re.Pattern, log=print) -> list[dict]:
     out: list[dict] = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, channel="chrome")
+            try:
+                browser = p.chromium.launch(headless=True, channel="chrome")
+            except Exception:  # no installed Chrome (the NAS container): Playwright's own Chromium
+                browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             for n in range(1, 7):  # ~110 SG roles, 20 per page
                 url = f"https://jobs.apple.com/en-sg/search?location=singapore-SGP&sort=newest&page={n}"
