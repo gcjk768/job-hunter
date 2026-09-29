@@ -403,7 +403,7 @@ def job_hash(pid: str) -> str:
 
 
 def buttons(pid: str) -> list[tuple[str, str]]:
-    return [("✅ Applied", f"a:{job_hash(pid)}"), ("🚫 Not interested", f"n:{job_hash(pid)}")]
+    return buttons_for(job_hash(pid))
 
 
 def poll_buttons(state: dict) -> None:
@@ -425,18 +425,36 @@ def poll_buttons(state: dict) -> None:
             continue
         action, _, h = (cq.get("data") or "").partition(":")
         e = by_hash.get(h)
+        keys, reply = None, "Already handled"
         if e and action in ("a", "n"):
             e["status"] = "applied" if action == "a" else "not interested"
             e["closed"] = str(dt.date.today())
             archive(e)
-        tg("answerCallbackQuery", {"callback_query_id": cq.get("id", ""),
-                                   "text": f"Marked {e['status']}" if e else "Already handled"})
+            keys, reply = [(f"✔ {e['status']}", "done:x"), ("↩️ Undo", f"u:{h}")], f"Marked {e['status']}"
+        elif e and action == "u" and e.get("status"):  # a stray tap: reopen it exactly as it was
+            reopen(e)
+            keys, reply = buttons_for(h), "Reopened"
+        tg("answerCallbackQuery", {"callback_query_id": cq.get("id", ""), "text": reply})
         msg = cq.get("message") or {}
-        if msg and e:
+        if msg and keys:
             tg("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
-                                          "reply_markup": json.dumps({"inline_keyboard": [[{
-                                              "text": f"✔ {e['status']}", "callback_data": "done:x"}]]})})
+                                          "reply_markup": json.dumps({"inline_keyboard": [[
+                                              {"text": t, "callback_data": d} for t, d in keys]]})})
     save(state)
+
+
+def buttons_for(h: str) -> list[tuple[str, str]]:
+    return [("✅ Applied", f"a:{h}"), ("🚫 Not interested", f"n:{h}")]
+
+
+def reopen(e: dict) -> None:
+    """Undo a button tap: back into the digest, note back from Archive/ to Jobs/."""
+    for key in ("status", "closed", "missing_since"):
+        e.pop(key, None)
+    note = VAULT / "Archive" / f"{e.get('note')}.md"
+    if e.get("note") and note.exists():
+        (VAULT / "Jobs").mkdir(parents=True, exist_ok=True)
+        note.replace(VAULT / "Jobs" / note.name)
 
 
 def tg(method: str, fields: dict) -> dict | None:

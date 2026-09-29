@@ -132,6 +132,14 @@ def nas_watcher() -> str:
     a.poll_buttons(state)
     if state["seen"][live_pid].get("status") != "applied" or state.get("tg_offset") != 7:
         return "button tap not applied"
+    # Undo reopens it: status gone, note back in Jobs/.
+    a.tg = lambda method, fields: {"result": [{"update_id": 8, "callback_query": {
+        "id": "q", "data": f"u:{a.job_hash(live_pid)}", "message": {"chat": {"id": 1}, "message_id": 2}}}]} \
+        if method == "getUpdates" else {}
+    a.poll_buttons(state)
+    note = state["seen"][live_pid].get("note")
+    if state["seen"][live_pid].get("status") or not (a.VAULT / "Jobs" / f"{note}.md").exists():
+        return "undo did not reopen the posting"
     # Two-stage judge: a non-fit never triggers the (expensive) documents call.
     calls = []
     a.ask_claude = lambda prompt: calls.append(prompt) or {"suitable": False, "score": 40}
