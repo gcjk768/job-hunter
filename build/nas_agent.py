@@ -185,11 +185,24 @@ def telegram(text: str) -> None:
     if not (token and chat):
         print("[TG] not configured:\n" + text)
         return
-    fields = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": "true"}
-    if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
-        fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
-    data = urllib.parse.urlencode(fields).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
+    for part in chunks(text):  # Telegram caps a message at 4096 chars; long digests go out in parts
+        fields = {"chat_id": chat, "text": part, "disable_web_page_preview": "true"}
+        if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
+            fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
+        data = urllib.parse.urlencode(fields).encode()
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
+
+
+def chunks(text: str, limit: int = 3900) -> list[str]:
+    """Split on line boundaries so no entry is cut mid-way; a single over-long line is hard-cut."""
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            out, cur, line = out + ([cur] if cur else []) + [line[:limit]], "", line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            out, cur = out + [cur], ""
+        cur = f"{cur}\n{line}" if cur else line
+    return out + ([cur] if cur else [])
 
 
 def candidates() -> list[dict]:
@@ -202,8 +215,14 @@ def candidates() -> list[dict]:
 
 
 def dupe_key(title: str, company: str) -> str:
-    """Same role under a new posting id: compare title + company, ignoring case and punctuation."""
-    return re.sub(r"[^a-z0-9]+", " ", f"{title} | {company}".lower()).strip()
+    """Same role under a new posting id: compare title + employer, ignoring case and punctuation. The
+    employer is its first distinctive word, because sources name it differently ("Amazon / AWS" on
+    amazon.jobs, "AMAZON WEB SERVICES SINGAPORE PRIVATE LIMITED" on MyCareersFuture)."""
+    words = [w for w in re.split(r"[^a-z0-9]+", company.lower()) if w and w not in GENERIC_CO]
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip() + " | " + (words[0] if words else "")
+
+
+GENERIC_CO = {"the", "singapore", "sg", "asia", "pacific", "apac", "global", "international", "group"}
 
 
 def _safe(text: str) -> str:
@@ -260,6 +279,28 @@ def baseline(state: dict, jobs: list[dict]) -> int:
     return recent
 
 
+CLOSE_AFTER_H = 24  # a judged posting missing this long is closed; a flaky source sweep is not enough
+
+
+def close_gone(state: dict, live: set[str]) -> None:
+    """Postings that left the boards drop out of digests, and their notes move to Archive/ (kept, not
+    deleted). The grace period stops one failed source fetch from closing everything it carries."""
+    now = time.time()
+    for pid, e in state["seen"].items():
+        if e.get("closed") or e.get("fit") is None:
+            continue
+        if pid in live:
+            e.pop("missing_since", None)
+            continue
+        if now - e.setdefault("missing_since", now) < CLOSE_AFTER_H * 3600:
+            continue
+        e["closed"] = str(dt.date.today())
+        note = VAULT / "Jobs" / f"{e.get('note')}.md"
+        if e.get("note") and note.exists():
+            (VAULT / "Archive").mkdir(parents=True, exist_ok=True)
+            note.replace(VAULT / "Archive" / note.name)
+
+
 def pay_of(r: dict) -> str:
     return "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
 
@@ -288,6 +329,7 @@ def cycle(state: dict) -> None:
     log["sweeps"] += 1
     log["candidates"] = len(jobs)
     ident = lambda r: r.get("uuid") or r["id"]  # noqa: E731
+    close_gone(state, {ident(r) for r in jobs})
     if not seen and not state.get("baselined"):
         state["baselined"] = True
         # First run: older postings count as already seen so it does not flood; the last few days are
@@ -350,9 +392,14 @@ def cycle(state: dict) -> None:
 
 
 def digest(state: dict) -> str:
-    log, day = today_log(state), str(dt.date.today())
-    judged = sorted((e for e in state["seen"].values() if e.get("d") == day), key=lambda e: -(e.get("fit") or 0))
-    fits = [e for e in judged if e.get("suitable")]
+    log, day, skips = today_log(state), str(dt.date.today()), skip_patterns()
+    # Only postings still on the boards, and never ones already applied to / rejected.
+    judged = sorted((e for e in state["seen"].values() if e.get("d") == day and not e.get("closed")
+                     and not any(p in f"{e.get('url', '')} {e['t']} @ {e['c']}".lower() for p in skips)),
+                    key=lambda e: -(e.get("fit") or 0))
+    shown: set[str] = set()  # a role judged twice before dedupe existed is listed once, best score
+    judged = [e for e in judged if not (dupe_key(e["t"], e["c"]) in shown or shown.add(dupe_key(e["t"], e["c"])))]
+    fits =[e for e in judged if e.get("suitable")]
     lines = [f"📋 Job digest {day} — {log['sweeps']} sweeps, {log['candidates']} postings on the boards, "
              f"{len(judged)} new judged, {len(fits)} fit."]
     if log["error"]:
@@ -364,9 +411,7 @@ def digest(state: dict) -> str:
     rest = [e for e in judged if not e.get("suitable")]
     if rest:
         lines.append("\nNot a fit:")
-        lines += [f"· {e.get('fit')} {e['t']} — {e['c'].title()}" for e in rest[:15]]
-        if len(rest) > 15:
-            lines.append(f"· …and {len(rest) - 15} more")
+        lines += [f"· {e.get('fit')} {e['t']} — {e['c'].title()}" for e in rest]
     if not judged:
         lines.append("Nothing new today.")
     text = "\n".join(lines)

@@ -95,6 +95,21 @@ def nas_watcher() -> str:
     a.digest(state)
     if not (a.VAULT / "Daily" / f"{today}.md").exists():
         return "daily digest note missing"
+    if a.dupe_key("Solutions Architect, AWS SGP", "Amazon / AWS") != \
+            a.dupe_key("Solutions Architect, AWS SGP", "AMAZON WEB SERVICES SINGAPORE PRIVATE LIMITED"):
+        return "cross-source repost (Amazon naming) not recognised"
+    parts = a.chunks("\n".join(f"line {i} " + "x" * 50 for i in range(400)))
+    if len(parts) < 2 or max(map(len, parts)) > 3900 or sum(p.count("line ") for p in parts) != 400:
+        return "long digest not split cleanly for Telegram"
+    # A judged posting gone from the boards for over a day: closed, note archived, out of the digest.
+    state["seen"]["1"]["missing_since"] = 0
+    a.candidates = lambda: [j for j in later if j["id"] != "1"]
+    a.judge = lambda r: {"suitable": False, "score": 10, "reason": "r", "gaps": "g"}
+    a.cycle(state)
+    if not state["seen"]["1"].get("closed") or not list((a.VAULT / "Archive").glob("*.md")):
+        return "closed posting not archived"
+    if "Senior SRE" in a.digest(state):
+        return "closed posting still in the digest"
     return ""
 
 
