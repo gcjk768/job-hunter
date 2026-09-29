@@ -42,6 +42,13 @@ import build_docs
 import job_sources
 import weekly_sweep as sweep
 
+try:  # private research files (gitignored); the public repo runs without them
+    import commute
+    import company_ratings
+    import estimate
+except ImportError:
+    commute = company_ratings = estimate = None
+
 ROOT = Path(__file__).resolve().parent.parent
 # Docker reads env_file only when the container is created, so a plain restart would miss a new .env.
 if (ROOT / ".env").exists():
@@ -72,7 +79,7 @@ FIT_THRESHOLD = int(os.environ.get("FIT_THRESHOLD", "70"))
 MASTER = build_docs.MASTER
 PROJECTS = [p["name"] for p in MASTER["projects"]]
 
-PROMPT = """You screen job postings for one candidate and, when one fits, write his tailored application.
+BASE = """You work for one job-seeking candidate.
 
 Today is {today}.
 
@@ -93,15 +100,20 @@ Pay: {pay}
 Min years: {years}
 Description:
 {desc}
-
-Return ONLY a JSON object:
+"""
+# Two stages: every posting gets the short screen; only a fit pays for the tailored documents, which
+# are most of the output tokens (a 4-6 paragraph letter per posting added up fast at 8 an hour).
+SCREEN = BASE + """
+Screen this posting. Return ONLY a JSON object:
 {{"suitable": bool, "score": 0-100 fit to the candidate's current role, "reason": "one sentence",
-  "gaps": "the honest gaps, one sentence", "coding_test_risk": "low|medium|high",
-  "tagline": "resume tagline for this role, pipe-separated like the candidate's",
+  "gaps": "the honest gaps, one sentence", "coding_test_risk": "low|medium|high"}}"""
+DOCS = BASE + """
+This posting already passed screening as a fit. Write the candidate's tailored application.
+Return ONLY a JSON object:
+{{"tagline": "resume tagline for this role, pipe-separated like the candidate's",
   "summary": "tailored professional summary, 90-130 words, first person implied, only true claims from the resume",
   "projects": [3-4 project names chosen ONLY from {projects}, most relevant first],
   "letter": ["4-6 cover-letter paragraphs: why this role, matching evidence against the posting's stated requirements, the honest gaps, close. No greeting or sign-off."]}}
-If suitable is false, leave tagline, summary, letter empty and projects [].
 Never invent employers, numbers, certifications or years that are not in the resume."""
 
 
@@ -151,10 +163,13 @@ def description(rec: dict) -> str:
 
 def judge(rec: dict) -> dict:
     pay = "not published" if rec.get("lo") is None else f"${rec['lo']:,}-{rec.get('hi') or ''}"
-    prompt = PROMPT.format(today=dt.date.today(), floor=sweep.SALARY_FLOOR,
-                           excluded=sweep.profile.EXCLUDED_EMPLOYERS_TEXT, profile=profile(), title=rec["title"], company=rec["company"], pay=pay,
-                           years=rec.get("years") or "n/s", desc=description(rec), projects=PROJECTS)
-    verdict = ask_claude(prompt)
+    fields = dict(today=dt.date.today(), floor=sweep.SALARY_FLOOR, excluded=sweep.profile.EXCLUDED_EMPLOYERS_TEXT,
+                  profile=profile(), title=rec["title"], company=rec["company"], pay=pay,
+                  years=rec.get("years") or "n/s", desc=description(rec), projects=PROJECTS)
+    verdict = ask_claude(SCREEN.format(**fields))
+    verdict.update(tagline="", summary="", letter=[], projects=[])
+    if verdict.get("suitable") and int(verdict.get("score") or 0) >= FIT_THRESHOLD:
+        verdict.update(ask_claude(DOCS.format(**fields)))
     # The model only gets to pick from the real project library; anything else is dropped.
     picks = [p for p in verdict.get("projects") or [] if p in PROJECTS]
     verdict["projects"] = picks or PROJECTS[:4]
@@ -180,15 +195,19 @@ def build(rec: dict, v: dict) -> Path:
     return outdir
 
 
-def telegram(text: str) -> None:
+def telegram(text: str, keys: list[tuple[str, str]] | None = None) -> None:
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (token and chat):
         print("[TG] not configured:\n" + text)
         return
-    for part in chunks(text):  # Telegram caps a message at 4096 chars; long digests go out in parts
+    parts = chunks(text)  # Telegram caps a message at 4096 chars; long digests go out in parts
+    for i, part in enumerate(parts):
         fields = {"chat_id": chat, "text": part, "disable_web_page_preview": "true"}
         if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
             fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
+        if keys and i == len(parts) - 1:
+            fields["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": t, "callback_data": d}
+                                                                      for t, d in keys]]})
         data = urllib.parse.urlencode(fields).encode()
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
 
@@ -242,6 +261,7 @@ def write_note(r: dict, v: dict, fit: bool, tier1: bool, folder: str | None) -> 
         f"pay: \"{pay_of(r)}\"\ncoding_test_risk: {v.get('coding_test_risk', '?')}\nurl: {r.get('url', '')}\n---\n\n"
         f"# {r['title']} — {r['company'].title()}\n\n**{status.upper()}** · fit {v.get('score')}/100\n\n"
         f"**Why:** {v.get('reason')}\n\n**Gaps:** {v.get('gaps')}\n\n"
+        + (f"{context(r)}\n\n" if context(r) else "")
         + (f"**Docs:** `tailored-auto/{folder}/`\n\n" if folder else "")
         + f"[Posting]({r.get('url', '')}) · [[{now:%Y-%m-%d}]]\n", encoding="utf-8")
     moc = VAULT / "Job Watcher.md"  # not Home.md: the project vault already has one
@@ -253,10 +273,48 @@ def write_note(r: dict, v: dict, fit: bool, tier1: bool, folder: str | None) -> 
 
 
 def skip_patterns() -> list[str]:
-    if not SKIP_FILE.exists():
-        return []
-    lines = (ln.split("#", 1)[0].strip().lower() for ln in SKIP_FILE.read_text(encoding="utf-8").splitlines())
-    return [ln for ln in lines if ln]
+    """skip.txt plus every posting id in the tracker's application log, so applying needs no extra step."""
+    out = []
+    if SKIP_FILE.exists():
+        lines = (ln.split("#", 1)[0].strip().lower() for ln in SKIP_FILE.read_text(encoding="utf-8").splitlines())
+        out += [ln for ln in lines if ln]
+    if TRACKER.exists():
+        for row in TRACKER.read_text(encoding="utf-8").splitlines():
+            if row.startswith("|") and APPLIED.search(row):
+                out += [m.lower() for m in re.findall(r"\(([A-Za-z]{0,3}\d{6,})\)", row)]
+    return out
+
+
+# Application-log rows look like "| 2026-09-13 | AWS | Solutions Architect I (10535776) | ... | **Applied ... |".
+TRACKER = ROOT / "docs" / "vault" / "Job Search Tracker.md"
+APPLIED = re.compile(r"\*\*(applied|rejected|withdrawn|interview|offer)", re.I)
+
+
+def context(r: dict) -> str:
+    """Commute, applicant count and the company research already in the project, one line each."""
+    lines = []
+    minutes, hub = r.get("minutes"), r.get("hub")
+    rating = company_ratings.lookup(r["company"]) if company_ratings else None
+    office = (rating or {}).get("office")
+    if minutes is None and office and commute:
+        minutes, hub = commute.travel_minutes(office["lat"], office["lng"])
+    if r.get("remote"):
+        lines.append("Commute: remote")
+    elif minutes is not None:
+        lines.append(f"Commute: ~{minutes} min from Choa Chu Kang" + (f" via {hub}" if hub else ""))
+    if r.get("applications") is not None:
+        lines.append(f"Applicants so far: {r['applications']}")
+    if rating:
+        scores = " ".join(f"{k} {rating[k]}" for k in ("prospect", "environment", "wlb", "growth") if rating.get(k))
+        verdict = f"Your verdict: {rating['verdict']} — {rating.get('verdict_reason', '')[:160]}" \
+            if rating.get("verdict") else ""
+        lines += [x for x in (f"Glassdoor (researched): {scores}" if scores else "",
+                              f"Interview screen: {rating['screen']}" if rating.get("screen") else "", verdict) if x]
+    elif estimate:
+        est = estimate.estimate(r.get("industry"), r.get("ssic"), r["company"], r.get("types"))
+        if est and est[1] != "Unclassified":
+            lines.append(f"Company (estimated, {est[1]}): " + " ".join(f"{k} {v}" for k, v in est[0].items()))
+    return "\n".join(lines)
 
 
 def skipped(r: dict, patterns: list[str]) -> bool:
@@ -295,10 +353,65 @@ def close_gone(state: dict, live: set[str]) -> None:
         if now - e.setdefault("missing_since", now) < CLOSE_AFTER_H * 3600:
             continue
         e["closed"] = str(dt.date.today())
-        note = VAULT / "Jobs" / f"{e.get('note')}.md"
-        if e.get("note") and note.exists():
-            (VAULT / "Archive").mkdir(parents=True, exist_ok=True)
-            note.replace(VAULT / "Archive" / note.name)
+        archive(e)
+
+
+def archive(e: dict) -> None:
+    note = VAULT / "Jobs" / f"{e.get('note')}.md"
+    if e.get("note") and note.exists():
+        (VAULT / "Archive").mkdir(parents=True, exist_ok=True)
+        note.replace(VAULT / "Archive" / note.name)
+
+
+# --- Telegram buttons: "Applied" / "Not interested" on each fit, handled on the next loop tick ---
+
+def job_hash(pid: str) -> str:
+    """callback_data is capped at 64 bytes and posting ids are URLs, so buttons carry a short hash."""
+    import hashlib
+    return hashlib.sha1(pid.encode()).hexdigest()[:10]
+
+
+def buttons(pid: str) -> list[tuple[str, str]]:
+    return [("✅ Applied", f"a:{job_hash(pid)}"), ("🚫 Not interested", f"n:{job_hash(pid)}")]
+
+
+def poll_buttons(state: dict) -> None:
+    """Close whatever was tapped: out of the digest, note archived, repost check keeps it from returning."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    offset = state.get("tg_offset", 0)
+    got = tg("getUpdates", {"offset": offset + 1, "timeout": 0,
+                            "allowed_updates": json.dumps(["callback_query"])}) or {}
+    by_hash = {job_hash(pid): e for pid, e in state["seen"].items()}
+    for upd in got.get("result", []):
+        state["tg_offset"] = upd["update_id"]
+        cq = upd.get("callback_query") or {}
+        action, _, h = (cq.get("data") or "").partition(":")
+        e = by_hash.get(h)
+        if e and action in ("a", "n"):
+            e["status"] = "applied" if action == "a" else "not interested"
+            e["closed"] = str(dt.date.today())
+            archive(e)
+        tg("answerCallbackQuery", {"callback_query_id": cq.get("id", ""),
+                                   "text": f"Marked {e['status']}" if e else "Already handled"})
+        msg = cq.get("message") or {}
+        if msg and e:
+            tg("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                          "reply_markup": json.dumps({"inline_keyboard": [[{
+                                              "text": f"✔ {e['status']}", "callback_data": "done:x"}]]})})
+    save(state)
+
+
+def tg(method: str, fields: dict) -> dict | None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    data = urllib.parse.urlencode(fields).encode()
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=30) as r:
+            return json.load(r)
+    except Exception as exc:  # a button glitch must never stop the watcher
+        print(f"  ! telegram {method}: {exc}")
+        return None
 
 
 def pay_of(r: dict) -> str:
@@ -379,15 +492,17 @@ def cycle(state: dict) -> None:
         seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": v.get("score"), "suitable": fit,
                           "tier1": tier1, "d": str(dt.date.today()), "url": r.get("url", ""),
                           "pay": pay_of(r), "why": v.get("reason"), "gaps": v.get("gaps"), "dir": folder,
-                          "note": note}
+                          "note": note, "ctx": context(r)}
         print(f"  {v.get('score'):>3} {'FIT ' if fit else 'skip'}{' T1' if tier1 else ''} "
               f"{r['title']} @ {r['company']}")
         if tier1 and suitable:
             docs = (f"Resume + cover letter: NAS docker/job-hunter/tailored-auto/{folder}/" if folder
                     else f"Below the {FIT_THRESHOLD} fit bar, so no documents drafted.")
+            ctx = context(r)
             telegram(f"⭐ Tier-1: {r['title']} — {r['company'].title()}\n{pay_of(r)} · fit {v.get('score')}/100 · "
                      f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\n"
-                     f"Gaps: {v.get('gaps')}\n\n{r.get('url', '')}\n\n{docs}\nNothing was submitted — your call.")
+                     f"Gaps: {v.get('gaps')}\n" + (f"\n{ctx}\n" if ctx else "")
+                     + f"\n{r.get('url', '')}\n\n{docs}\nNothing was submitted — your call.", buttons(ident(r)))
         save(state)
 
 
@@ -406,8 +521,8 @@ def digest(state: dict) -> str:
         lines.append(f"⚠️ {log['failed']} judge failures (retried next sweep). Last error: {log['error']}")
     for e in fits:
         lines.append(f"\n✅ {'⭐ ' if e.get('tier1') else ''}{e['t']} — {e['c'].title()}\n{e['pay']} · "
-                     f"fit {e['fit']}/100\nWhy: {e['why']}\nGaps: {e['gaps']}\n{e['url']}\n"
-                     f"Docs: tailored-auto/{e['dir']}/")
+                     f"fit {e['fit']}/100\nWhy: {e['why']}\nGaps: {e['gaps']}\n"
+                     + (f"{e['ctx']}\n" if e.get("ctx") else "") + f"{e['url']}\nDocs: tailored-auto/{e['dir']}/")
     rest = [e for e in judged if not e.get("suitable")]
     if rest:
         lines.append("\nNot a fit:")
@@ -422,9 +537,31 @@ def digest(state: dict) -> str:
     return text
 
 
+def send_digest(state: dict) -> None:
+    """The digest, then one short message per open fit carrying its Applied / Not interested buttons."""
+    telegram(digest(state))
+    day = str(dt.date.today())
+    for pid, e in state["seen"].items():
+        if e.get("d") == day and e.get("suitable") and not e.get("closed"):
+            telegram(f"{'⭐ ' if e.get('tier1') else ''}{e['t']} — {e['c'].title()} (fit {e['fit']})", buttons(pid))
+
+
+def write_status(state: dict) -> None:
+    """Status note in the vault; its timestamp is also the heartbeat build/nas_heartbeat.py checks on the PC."""
+    log = today_log(state)
+    last = dt.datetime.fromtimestamp(state.get("last_sweep", 0))
+    (VAULT / "Status.md").parent.mkdir(parents=True, exist_ok=True)
+    (VAULT / "Status.md").write_text(
+        f"---\ntags: [active]\nupdated: {dt.datetime.now():%Y-%m-%d %H:%M}\n---\n\n# Job Watcher status\n\n"
+        f"- Last sweep: {last:%Y-%m-%d %H:%M} (every {INTERVAL_H:g}h)\n- Today: {log['sweeps']} sweeps, "
+        f"{log['candidates']} postings on the boards, {log['failed']} judge failures\n"
+        f"- Digest: {'sent' if state.get('digest_on') == str(dt.date.today()) else f'due {DIGEST_HOUR}:00'}\n"
+        + (f"- Last error: {log['error']}\n" if log["error"] else ""), encoding="utf-8")
+
+
 def main() -> None:
     if "--digest" in sys.argv:
-        telegram(digest(load()))
+        send_digest(load())
         return
     once = "--once" in sys.argv
     code = lambda: {f: f.stat().st_mtime for f in Path(__file__).parent.glob("*.py")}  # noqa: E731
@@ -442,17 +579,23 @@ def main() -> None:
                 traceback.print_exc()
                 today_log(state)["error"] = f"sweep crashed: {exc}"[:300]
             save(state)
+            write_status(state)
             if once:
                 return
         today = str(dt.date.today())
         if dt.datetime.now().hour >= DIGEST_HOUR and state.get("digest_on") != today:
             try:
-                telegram(digest(state))
+                send_digest(state)
                 state["digest_on"] = today
                 save(state)
+                write_status(state)
             except Exception:
                 traceback.print_exc()  # retried on the next tick
-        time.sleep(600)
+        try:
+            poll_buttons(state)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(60)  # short tick so a button tap is handled within a minute
 
 
 if __name__ == "__main__":

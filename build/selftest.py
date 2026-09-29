@@ -57,11 +57,13 @@ def nas_watcher() -> str:
 
     import nas_agent as a
 
+    real_judge = a.judge
     tmp = Path(tempfile.mkdtemp())
     a.VAULT, a.STATE, a.SKIP_FILE = tmp / "vault", tmp / "state.json", tmp / "skip.txt"
     a.SKIP_FILE.write_text("10525204  # AWS SGP, rejected\n", encoding="utf-8")
     sent, judged = [], []
-    a.telegram, a.build = sent.append, (lambda r, v: tmp / "docs")
+    a.telegram, a.build = (lambda text, keys=None: sent.append(text)), (lambda r, v: tmp / "docs")
+    a.TRACKER = tmp / "no-tracker.md"
     today, old = str(dt.date.today()), "2020-01-01"
     job = lambda i, t, c, posted=today: {"id": i, "title": t, "company": c, "url": f"u/{i}",  # noqa: E731
                                          "lo": None, "posted": posted, "desc": "x"}
@@ -110,6 +112,33 @@ def nas_watcher() -> str:
         return "closed posting not archived"
     if "Senior SRE" in a.digest(state):
         return "closed posting still in the digest"
+    # Tracker rows marked applied feed the skip list with no manual step.
+    a.TRACKER = tmp / "tracker.md"
+    a.TRACKER.write_text("| 2026-09-13 | AWS | Solutions Architect I (10535776) | amazon.jobs | **Applied 2026-09-13** |\n"
+                         "| 2026-09-14 | Acme | SRE (99999999) | mcf | unsent |\n", encoding="utf-8")
+    pats = a.skip_patterns()
+    if "10535776" not in pats or "99999999" in pats:
+        return f"tracker applied-ids not parsed right: {pats}"
+    # A tapped "Applied" button closes the posting and archives its note.
+    live_pid = "5"
+    a.tg = lambda method, fields: {"result": [{"update_id": 7, "callback_query": {
+        "id": "q", "data": f"a:{a.job_hash(live_pid)}", "message": {"chat": {"id": 1}, "message_id": 2}}}]} \
+        if method == "getUpdates" else {}
+    a.poll_buttons(state)
+    if state["seen"][live_pid].get("status") != "applied" or state.get("tg_offset") != 7:
+        return "button tap not applied"
+    # Two-stage judge: a non-fit never triggers the (expensive) documents call.
+    calls = []
+    a.ask_claude = lambda prompt: calls.append(prompt) or {"suitable": False, "score": 40}
+    a.description = lambda r: "x"
+    real_judge({"title": "T", "company": "C", "lo": None})
+    if len(calls) != 1:
+        return f"non-fit made {len(calls)} model calls"
+    calls.clear()
+    a.ask_claude = lambda prompt: calls.append(prompt) or ({"suitable": True, "score": 90} if len(calls) == 1
+                                                          else {"letter": ["p"], "projects": []})
+    if not real_judge({"title": "T", "company": "C", "lo": None}).get("letter") or len(calls) != 2:
+        return "fit did not get its documents"
     return ""
 
 
