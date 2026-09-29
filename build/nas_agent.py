@@ -199,22 +199,19 @@ def build(rec: dict, v: dict) -> Path:
     return outdir
 
 
-def telegram(text: str, keys: list[tuple[str, str]] | None = None, rich: bool = False) -> None:
+def telegram(text: str, rich: bool = False) -> None:
     """rich=True sends Telegram HTML: every interpolated value must then go through html.escape."""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (token and chat):
         print("[TG] not configured:\n" + text)
         return
     parts = chunks(text)  # Telegram caps a message at 4096 chars; long digests go out in parts
-    for i, part in enumerate(parts):
+    for part in parts:
         fields = {"chat_id": chat, "text": part, "disable_web_page_preview": "true"}
         if rich:
             fields["parse_mode"] = "HTML"
         if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
             fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
-        if keys and i == len(parts) - 1:
-            fields["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": t, "callback_data": d}
-                                                                      for t, d in keys]]})
         data = urllib.parse.urlencode(fields).encode()
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
 
@@ -394,80 +391,6 @@ def archive(e: dict) -> None:
         note.replace(VAULT / "Archive" / note.name)
 
 
-# --- Telegram buttons: "Applied" / "Not interested" on each fit, handled on the next loop tick ---
-
-def job_hash(pid: str) -> str:
-    """callback_data is capped at 64 bytes and posting ids are URLs, so buttons carry a short hash."""
-    import hashlib
-    return hashlib.sha1(pid.encode()).hexdigest()[:10]
-
-
-def buttons(pid: str) -> list[tuple[str, str]]:
-    return buttons_for(job_hash(pid))
-
-
-def poll_buttons(state: dict) -> None:
-    """Close whatever was tapped: out of the digest, note archived, repost check keeps it from returning."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        return
-    offset = state.get("tg_offset", 0)
-    got = tg("getUpdates", {"offset": offset + 1, "timeout": 0,
-                            "allowed_updates": json.dumps(["callback_query"])}) or {}
-    updates = got.get("result", [])
-    if not updates:
-        return  # nothing tapped: no save, so this never races a sweep's own save
-    by_hash = {job_hash(pid): e for pid, e in state["seen"].items()}
-    for upd in updates:
-        state["tg_offset"] = upd["update_id"]
-        cq = upd.get("callback_query")
-        if not cq:  # messages queued for the bot before buttons existed; nothing to answer
-            continue
-        action, _, h = (cq.get("data") or "").partition(":")
-        e = by_hash.get(h)
-        keys, reply = None, "Already handled"
-        if e and action in ("a", "n"):
-            e["status"] = "applied" if action == "a" else "not interested"
-            e["closed"] = str(dt.date.today())
-            archive(e)
-            keys, reply = [(f"✔ {e['status']}", "done:x"), ("↩️ Undo", f"u:{h}")], f"Marked {e['status']}"
-        elif e and action == "u" and e.get("status"):  # a stray tap: reopen it exactly as it was
-            reopen(e)
-            keys, reply = buttons_for(h), "Reopened"
-        tg("answerCallbackQuery", {"callback_query_id": cq.get("id", ""), "text": reply})
-        msg = cq.get("message") or {}
-        if msg and keys:
-            tg("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
-                                          "reply_markup": json.dumps({"inline_keyboard": [[
-                                              {"text": t, "callback_data": d} for t, d in keys]]})})
-    save(state)
-
-
-def buttons_for(h: str) -> list[tuple[str, str]]:
-    return [("✅ Applied", f"a:{h}"), ("🚫 Not interested", f"n:{h}")]
-
-
-def reopen(e: dict) -> None:
-    """Undo a button tap: back into the digest, note back from Archive/ to Jobs/."""
-    for key in ("status", "closed", "missing_since"):
-        e.pop(key, None)
-    note = VAULT / "Archive" / f"{e.get('note')}.md"
-    if e.get("note") and note.exists():
-        (VAULT / "Jobs").mkdir(parents=True, exist_ok=True)
-        note.replace(VAULT / "Jobs" / note.name)
-
-
-def tg(method: str, fields: dict) -> dict | None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    data = urllib.parse.urlencode(fields).encode()
-    try:
-        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=30) as r:
-            return json.load(r)
-    except Exception as exc:  # a button glitch must never stop the watcher
-        print(f"  ! telegram {method}: {exc}")
-        return None
-
-
 def pay_of(r: dict) -> str:
     if r.get("lo") is not None:
         return f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
@@ -594,7 +517,7 @@ def cycle(state: dict) -> None:
             telegram(card(seen[ident(r)], "⭐ Tier-1:")
                      + f"\ncoding-test risk {html.escape(str(v.get('coding_test_risk', '?')))}"
                      + ("" if folder else f"\nBelow the {FIT_THRESHOLD} fit bar, so no documents drafted.")
-                     + "\nNothing was submitted — your call.", buttons(ident(r)), rich=True)
+                     + "\nNothing was submitted — your call.", rich=True)
         save(state)
 
 
@@ -626,15 +549,6 @@ def digest(state: dict) -> str:
     daily.write_text(f"---\ntags: [digest]\ndate: {day}\n---\n\n{plain}\n\n## Notes\n"
                      + "".join(f"- [[{e['note']}]]\n" for e in judged if e.get("note")), encoding="utf-8")
     return text
-
-
-def send_digest(state: dict) -> None:
-    """The digest, then one short message per open fit carrying its Applied / Not interested buttons."""
-    telegram(digest(state), rich=True)
-    day = str(dt.date.today())
-    for pid, e in state["seen"].items():
-        if e.get("d") == day and e.get("suitable") and not e.get("closed"):
-            telegram(f"{'⭐ ' if e.get('tier1') else ''}{label(e)} (fit {e['fit']})", buttons(pid))
 
 
 def rejudge(state: dict, n: int) -> None:
@@ -672,8 +586,8 @@ def rejudge(state: dict, n: int) -> None:
     telegram(f"🔁 <b>Re-scored top {len(changed)}</b> with full job descriptions: {len(fits)} fit\n"
              + "\n".join(f"{e['fit']}" + (f" <i>(was {e['was']})</i>" if e.get("was") not in (None, e["fit"]) else "")
                          + f" · {html.escape(label(e))}" for _, e in changed), rich=True)
-    for pid, e in fits:
-        telegram(card(e), buttons(pid), rich=True)
+    for _, e in fits:
+        telegram(card(e), rich=True)
 
 
 def weekly(state: dict) -> str:
@@ -717,7 +631,7 @@ def write_status(state: dict) -> None:
 
 def main() -> None:
     if "--digest" in sys.argv:
-        send_digest(load())
+        telegram(digest(load()), rich=True)
         return
     once = "--once" in sys.argv
     code = lambda: {f: f.stat().st_mtime for f in Path(__file__).parent.glob("*.py")}  # noqa: E731
@@ -749,7 +663,7 @@ def main() -> None:
         today = str(dt.date.today())
         if dt.datetime.now().hour >= DIGEST_HOUR and state.get("digest_on") != today:
             try:
-                send_digest(state)
+                telegram(digest(state), rich=True)
                 if dt.date.today().weekday() == 6:  # Sunday
                     telegram(weekly(state))
                 state["digest_on"] = today
@@ -757,11 +671,7 @@ def main() -> None:
                 write_status(state)
             except Exception:
                 traceback.print_exc()  # retried on the next tick
-        try:
-            poll_buttons(state)
-        except Exception:
-            traceback.print_exc()
-        time.sleep(60)  # short tick so a button tap is handled within a minute
+        time.sleep(600)
 
 
 if __name__ == "__main__":
