@@ -113,7 +113,8 @@ Return ONLY a JSON object:
 {{"tagline": "resume tagline for this role, pipe-separated like the candidate's",
   "summary": "tailored professional summary, 90-130 words, first person implied, only true claims from the resume",
   "projects": [3-4 project names chosen ONLY from {projects}, most relevant first],
-  "letter": ["4-6 cover-letter paragraphs: why this role, matching evidence against the posting's stated requirements, the honest gaps, close. No greeting or sign-off."]}}
+  "letter": ["4-6 cover-letter paragraphs: why this role, matching evidence against the posting's stated requirements, the honest gaps, close. No greeting or sign-off."],
+  "interview": ["5-7 likely interview questions for this posting, each followed by ' — ' and a one-line talking point from the candidate's real projects or experience"]}}
 Never invent employers, numbers, certifications or years that are not in the resume."""
 
 
@@ -167,7 +168,7 @@ def judge(rec: dict) -> dict:
                   profile=profile(), title=rec["title"], company=rec["company"], pay=pay,
                   years=rec.get("years") or "n/s", desc=description(rec), projects=PROJECTS)
     verdict = ask_claude(SCREEN.format(**fields))
-    verdict.update(tagline="", summary="", letter=[], projects=[])
+    verdict.update(tagline="", summary="", letter=[], projects=[], interview=[])
     if verdict.get("suitable") and int(verdict.get("score") or 0) >= FIT_THRESHOLD:
         verdict.update(ask_claude(DOCS.format(**fields)))
     # The model only gets to pick from the real project library; anything else is dropped.
@@ -191,7 +192,9 @@ def build(rec: dict, v: dict) -> Path:
     (outdir / "fit.md").write_text(
         f"# {rec['title']} — {rec['company']}\n\n{rec.get('url', '')}\n\n"
         f"Score {v.get('score')} · coding-test risk {v.get('coding_test_risk')}\n\n"
-        f"Why: {v.get('reason')}\n\nGaps: {v.get('gaps')}\n", encoding="utf-8")
+        f"Why: {v.get('reason')}\n\nGaps: {v.get('gaps')}\n"
+        + ("\n## Interview prep\n\n" + "".join(f"- {q}\n" for q in v["interview"]) if v.get("interview") else ""),
+        encoding="utf-8")
     return outdir
 
 
@@ -263,6 +266,8 @@ def write_note(r: dict, v: dict, fit: bool, tier1: bool, folder: str | None) -> 
         f"**Why:** {v.get('reason')}\n\n**Gaps:** {v.get('gaps')}\n\n"
         + (f"{context(r)}\n\n" if context(r) else "")
         + (f"**Docs:** `tailored-auto/{folder}/`\n\n" if folder else "")
+        + ("## Interview prep\n\n" + "".join(f"- {q}\n" for q in v["interview"]) + "\n"
+           if v.get("interview") else "")
         + f"[Posting]({r.get('url', '')}) · [[{now:%Y-%m-%d}]]\n", encoding="utf-8")
     moc = VAULT / "Job Watcher.md"  # not Home.md: the project vault already has one
     if not moc.exists():
@@ -318,7 +323,8 @@ def context(r: dict) -> str:
 
 
 def skipped(r: dict, patterns: list[str]) -> bool:
-    hay = f"{r.get('uuid') or ''} {r['id']} {r.get('url') or ''} {r['title']} @ {r['company']}".lower()
+    # MyCareersFuture records carry "uuid" and no "id"; career-page records the reverse.
+    hay = f"{r.get('uuid') or ''} {r.get('id') or ''} {r.get('url') or ''} {r['title']} @ {r['company']}".lower()
     return any(p in hay for p in patterns)
 
 
@@ -415,7 +421,47 @@ def tg(method: str, fields: dict) -> dict | None:
 
 
 def pay_of(r: dict) -> str:
-    return "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
+    if r.get("lo") is not None:
+        return f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
+    est = pay_estimate(r["title"])
+    return f"pay not published (est. {est})" if est else "pay not published"
+
+
+# Market estimate for postings that hide pay: the median posted band of similar roles from the same
+# sweep (MyCareersFuture publishes bands). Labelled "est." everywhere — it is a market figure, not an offer.
+FAMILIES = [("solutions architect", r"solutions?\s+architect|pre-?sales|customer engineer"),
+            ("SRE", r"site reliability|\bsre\b|reliability engineer"),
+            ("security", r"secur|devsecops"),
+            ("platform", r"platform"),
+            ("DevOps", r"devops|ci/?cd|release engineer"),
+            ("cloud / infrastructure", r"cloud|infrastructure|infra\b|systems engineer")]
+LEVELS = [("senior+", r"senior|\bsr\.?\b|lead|principal|staff|\biii\b|vice president|\bvp\b|manager"),
+          ("mid", r".")]
+_BANDS: dict[tuple[str, str], list[tuple[int, int]]] = {}
+
+
+def role_key(title: str) -> tuple[str, str] | None:
+    fam = next((f for f, rx in FAMILIES if re.search(rx, title, re.I)), None)
+    lvl = next(lv for lv, rx in LEVELS if re.search(rx, title, re.I))
+    return (fam, lvl) if fam else None
+
+
+def learn_bands(jobs: list[dict]) -> None:
+    _BANDS.clear()
+    for r in jobs:
+        k = role_key(r["title"])
+        if k and r.get("lo") and r.get("hi"):
+            _BANDS.setdefault(k, []).append((r["lo"], r["hi"]))
+
+
+def pay_estimate(title: str, min_n: int = 3) -> str | None:
+    k = role_key(title)
+    bands = _BANDS.get(k, []) if k else []
+    if len(bands) < min_n:
+        return None
+    los, his = sorted(b[0] for b in bands), sorted(b[1] for b in bands)
+    mid = len(bands) // 2
+    return f"${los[mid]:,}–{his[mid]:,}/mo, median of {len(bands)} posted {k[1]} {k[0]} bands"
 
 
 def load() -> dict:
@@ -443,6 +489,7 @@ def cycle(state: dict) -> None:
     log["candidates"] = len(jobs)
     ident = lambda r: r.get("uuid") or r["id"]  # noqa: E731
     close_gone(state, {ident(r) for r in jobs})
+    learn_bands(jobs)
     if not seen and not state.get("baselined"):
         state["baselined"] = True
         # First run: older postings count as already seen so it does not flood; the last few days are
@@ -546,6 +593,32 @@ def send_digest(state: dict) -> None:
             telegram(f"{'⭐ ' if e.get('tier1') else ''}{e['t']} — {e['c'].title()} (fit {e['fit']})", buttons(pid))
 
 
+def weekly(state: dict) -> str:
+    """Sunday's look back over 7 days: volume, fits and what happened to them, who is hiring."""
+    today = dt.date.today()
+    since = str(today - dt.timedelta(days=7))
+    week = [e for e in state["seen"].values() if e.get("d") and e["d"] > since]
+    fits = sorted((e for e in week if e.get("suitable")), key=lambda e: -(e.get("fit") or 0))
+    employers: dict[str, int] = {}
+    for e in week:
+        employers[e["c"].title()] = employers.get(e["c"].title(), 0) + 1
+    top = sorted(employers.items(), key=lambda kv: -kv[1])[:8]
+    closed = sum(1 for e in week if e.get("closed") and not e.get("status"))
+    lines = [f"🗓 Week to {today} — {len(week)} new postings judged, {len(fits)} fit, {closed} already off the boards."]
+    if fits:
+        lines.append("\nFits this week:")
+        lines += [f"· {e['fit']} {e['t']} — {e['c'].title()} [{e.get('status') or ('closed' if e.get('closed') else 'open')}]"
+                  for e in fits]
+    if top:
+        lines.append("\nMost active employers: " + ", ".join(f"{c} ({n})" for c, n in top))
+    text = "\n".join(lines)
+    iso = today.isocalendar()
+    path = VAULT / "Weekly" / f"{iso.year}-W{iso.week:02d}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\ntags: [digest]\ndate: {today}\n---\n\n{text}\n", encoding="utf-8")
+    return text
+
+
 def write_status(state: dict) -> None:
     """Status note in the vault; its timestamp is also the heartbeat build/nas_heartbeat.py checks on the PC."""
     log = today_log(state)
@@ -586,6 +659,8 @@ def main() -> None:
         if dt.datetime.now().hour >= DIGEST_HOUR and state.get("digest_on") != today:
             try:
                 send_digest(state)
+                if dt.date.today().weekday() == 6:  # Sunday
+                    telegram(weekly(state))
                 state["digest_on"] = today
                 save(state)
                 write_status(state)

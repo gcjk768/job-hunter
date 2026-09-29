@@ -70,7 +70,10 @@ def nas_watcher() -> str:
     first = [job("1", "Senior SRE", "NVIDIA"), job("2", "Old Role", "Acme", old)]
     later = first + [job("3", "Senior SRE ", "nvidia"),                       # repost of 1
                      job("amazon.jobs/10525204", "Solutions Architect", "Amazon"),  # on skip list
-                     job("5", "DevOps Engineer", "Beta Pte")]
+                     job("5", "DevOps Engineer", "Beta Pte"),
+                     # MyCareersFuture shape: "uuid", no "id" (this crashed the first NAS sweep in testing)
+                     {"uuid": "mcf-1", "title": "Cloud Engineer", "company": "Delta Pte", "url": "u/mcf",
+                      "lo": 9000, "hi": 12000, "posted": old, "source": "MyCareersFuture"}]
     a.judge = lambda r: judged.append(r["id"]) or {"suitable": True, "score": 80, "letter": ["x"],
                                                    "reason": "r", "gaps": "g"}
     state = {"seen": {}}
@@ -105,7 +108,7 @@ def nas_watcher() -> str:
         return "long digest not split cleanly for Telegram"
     # A judged posting gone from the boards for over a day: closed, note archived, out of the digest.
     state["seen"]["1"]["missing_since"] = 0
-    a.candidates = lambda: [j for j in later if j["id"] != "1"]
+    a.candidates = lambda: [j for j in later if j.get("id") != "1"]
     a.judge = lambda r: {"suitable": False, "score": 10, "reason": "r", "gaps": "g"}
     a.cycle(state)
     if not state["seen"]["1"].get("closed") or not list((a.VAULT / "Archive").glob("*.md")):
@@ -139,6 +142,20 @@ def nas_watcher() -> str:
                                                           else {"letter": ["p"], "projects": []})
     if not real_judge({"title": "T", "company": "C", "lo": None}).get("letter") or len(calls) != 2:
         return "fit did not get its documents"
+    # Pay estimate: median posted band of similar roles, only with enough samples, never for a paid posting.
+    a.learn_bands([{"title": f"Senior SRE {i}", "lo": lo, "hi": lo + 3000} for i, lo in
+                   enumerate((8000, 9000, 10000))] + [{"title": "Senior DevOps", "lo": 7000, "hi": 9000}])
+    if "$9,000–12,000/mo" not in a.pay_of({"title": "Senior Site Reliability Engineer", "lo": None}):
+        return f"pay estimate wrong: {a.pay_of({'title': 'Senior Site Reliability Engineer', 'lo': None})}"
+    if "est." in a.pay_of({"title": "Senior DevOps Engineer", "lo": None}):
+        return "estimated from a single band"
+    # Interview prep lands in the note; the weekly roll-up is written and counts the week's fits.
+    name = a.write_note({"company": "Acme", "title": "SRE", "url": "u", "lo": None},
+                        {"score": 90, "interview": ["Q1 — A1"]}, True, False, None)
+    if "Interview prep" not in (a.VAULT / "Jobs" / f"{name}.md").read_text(encoding="utf-8"):
+        return "interview prep missing from note"
+    if "fit" not in a.weekly(state) or not list((a.VAULT / "Weekly").glob("*.md")):
+        return "weekly summary missing"
     return ""
 
 
