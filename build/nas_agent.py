@@ -389,10 +389,15 @@ def poll_buttons(state: dict) -> None:
     offset = state.get("tg_offset", 0)
     got = tg("getUpdates", {"offset": offset + 1, "timeout": 0,
                             "allowed_updates": json.dumps(["callback_query"])}) or {}
+    updates = got.get("result", [])
+    if not updates:
+        return  # nothing tapped: no save, so this never races a sweep's own save
     by_hash = {job_hash(pid): e for pid, e in state["seen"].items()}
-    for upd in got.get("result", []):
+    for upd in updates:
         state["tg_offset"] = upd["update_id"]
-        cq = upd.get("callback_query") or {}
+        cq = upd.get("callback_query")
+        if not cq:  # messages queued for the bot before buttons existed; nothing to answer
+            continue
         action, _, h = (cq.get("data") or "").partition(":")
         e = by_hash.get(h)
         if e and action in ("a", "n"):
@@ -593,6 +598,44 @@ def send_digest(state: dict) -> None:
             telegram(f"{'⭐ ' if e.get('tier1') else ''}{e['t']} — {e['c'].title()} (fit {e['fit']})", buttons(pid))
 
 
+def rejudge(state: dict, n: int) -> None:
+    """Re-score today's top-n open postings with the current judge (job text, context, two stages) and
+    send the fits again. Requested by `touch /app/state/rejudge` so it runs inside the loop, never beside it."""
+    ident = lambda r: r.get("uuid") or r.get("id")  # noqa: E731
+    live = {ident(r): r for r in candidates()}
+    learn_bands(list(live.values()))
+    day = str(dt.date.today())
+    top = sorted(((pid, e) for pid, e in state["seen"].items()
+                  if e.get("d") == day and e.get("fit") is not None and not e.get("closed") and pid in live),
+                 key=lambda pe: -(pe[1].get("fit") or 0))[:n]
+    changed = []
+    for pid, e in top:
+        r = live[pid]
+        try:
+            v = judge(r)
+        except Exception as exc:
+            print(f"  ! rejudge failed for {r['title']}: {exc}")
+            continue
+        fit = bool(v.get("suitable")) and int(v.get("score") or 0) >= FIT_THRESHOLD and bool(v.get("letter"))
+        old_note = VAULT / "Jobs" / f"{e.get('note')}.md"
+        if e.get("note") and old_note.exists():
+            old_note.unlink()  # replaced by the re-scored note below
+        folder = build(r, v).name if fit else None
+        e.update(fit=v.get("score"), suitable=fit, why=v.get("reason"), gaps=v.get("gaps"), dir=folder,
+                 url=r.get("url", ""),
+                 pay=pay_of(r), ctx=context(r), note=write_note(r, v, fit, bool(e.get("tier1")), folder))
+        print(f"  {e['fit']:>3} {'FIT ' if fit else 'skip'} (re-scored) {r['title']} @ {r['company']}")
+        changed.append((pid, e))
+        save(state)
+    fits = [(pid, e) for pid, e in changed if e.get("suitable")]
+    telegram(f"🔁 Re-scored today's top {len(changed)} with full job descriptions: {len(fits)} fit.\n"
+             + "\n".join(f"· {e['fit']} {e['t']} — {e['c'].title()}" for _, e in changed))
+    for pid, e in fits:
+        telegram(f"✅ {'⭐ ' if e.get('tier1') else ''}{e['t']} — {e['c'].title()}\n{e['pay']} · fit {e['fit']}/100\n"
+                 f"Why: {e['why']}\nGaps: {e['gaps']}\n" + (f"{e['ctx']}\n" if e.get("ctx") else "")
+                 + f"{e['url']}\nDocs: tailored-auto/{e['dir']}/", buttons(pid))
+
+
 def weekly(state: dict) -> str:
     """Sunday's look back over 7 days: volume, fits and what happened to them, who is hiring."""
     today = dt.date.today()
@@ -644,6 +687,14 @@ def main() -> None:
             print("code changed on disk, reloading", flush=True)
             os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
         state = load()
+        request = STATE.parent / "rejudge"
+        if request.exists():
+            n = int(request.read_text().strip() or 20)
+            request.unlink()
+            try:
+                rejudge(state, n)
+            except Exception:
+                traceback.print_exc()
         if time.time() - state.get("last_sweep", 0) >= INTERVAL_H * 3600:
             state["last_sweep"] = time.time()
             try:
