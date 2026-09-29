@@ -6,6 +6,7 @@
 !/README.md
 !/build/
 !/deploy/
+!/docs/
 
 /build/*
 !/build/nas_agent.py
@@ -20,3 +21,8 @@
 !/deploy/nas/
 /deploy/nas/*
 !/deploy/nas/compose.yaml
+
+/docs/*
+!/docs/architecture.drawio
+!/docs/architecture.drawio.svg
+!/docs/architecture.png
