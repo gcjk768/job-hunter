@@ -11,6 +11,7 @@ just that the file parses.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -62,7 +63,7 @@ def nas_watcher() -> str:
     a.VAULT, a.STATE, a.SKIP_FILE = tmp / "vault", tmp / "state.json", tmp / "skip.txt"
     a.SKIP_FILE.write_text("10525204  # AWS SGP, rejected\n", encoding="utf-8")
     sent, judged = [], []
-    a.telegram, a.build = (lambda text, keys=None: sent.append(text)), (lambda r, v: tmp / "docs")
+    a.telegram, a.build = (lambda text, keys=None, rich=False: sent.append(text)), (lambda r, v: tmp / "docs")
     a.TRACKER = tmp / "no-tracker.md"
     today, old = str(dt.date.today()), "2020-01-01"
     job = lambda i, t, c, posted=today: {"id": i, "title": t, "company": c, "url": f"u/{i}",  # noqa: E731
@@ -127,6 +128,7 @@ def nas_watcher() -> str:
     a.tg = lambda method, fields: {"result": [{"update_id": 7, "callback_query": {
         "id": "q", "data": f"a:{a.job_hash(live_pid)}", "message": {"chat": {"id": 1}, "message_id": 2}}}]} \
         if method == "getUpdates" else {}
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test")  # poll_buttons is a no-op without a token
     a.poll_buttons(state)
     if state["seen"][live_pid].get("status") != "applied" or state.get("tg_offset") != 7:
         return "button tap not applied"
