@@ -1,10 +1,15 @@
 # Job watcher on the UGREEN NAS — UGOS Docker project `job-hunter`, share docker/job-hunter.
-# Sweeps every SWEEP_INTERVAL_HOURS, judges new postings with Ollama Cloud through the
-# trading-desk's signed-in Ollama container (the Pro subscription lives in its .ollama key),
-# drafts resume + cover letter into ./tailored-auto/, and posts to Telegram. Never applies.
+# Sweeps every SWEEP_INTERVAL_HOURS, judges new postings with Claude through the Claude Code CLI
+# (`claude -p`, tools disabled), drafts resume + cover letter into ./tailored-auto/, and posts to
+# Telegram. Never applies.
 #
 # Share layout:  compose.yaml  Dockerfile  .env  build/*.py   (tailored-auto/ and build/.nas_state.json appear on first run)
 # Code changes: copy build/*.py and restart. Dockerfile changes: rebuild the project.
+#
+# .env (never commit it):
+#   CLAUDE_CODE_OAUTH_TOKEN=...   # from `claude setup-token` on your PC; bills your Claude subscription
+#                                 # (or ANTHROPIC_API_KEY=... to bill the API instead)
+#   TELEGRAM_BOT_TOKEN=...  TELEGRAM_CHAT_ID=...  TELEGRAM_THREAD_ID=...
 services:
   job-hunter:
     build: .                           # deploy/nas/Dockerfile, copied next to this file
@@ -12,29 +17,22 @@ services:
     container_name: job-hunter
     restart: unless-stopped
     working_dir: /app
-    env_file:                          # TELEGRAM_BOT_TOKEN / _CHAT_ID / _THREAD_ID; never commit it
+    env_file:
       - path: .env
         required: false
     environment:
       TZ: Asia/Singapore
       PYTHONUNBUFFERED: "1"
-      OLLAMA_BASE_URL: http://trading-ollama:11434
-      JOB_MODEL: deepseek-v4.1-flash:cloud   # the model the desk benchmarked for valid JSON
+      JOB_MODEL: sonnet                # any `claude --model` value: haiku is cheaper, opus is stronger
       SWEEP_INTERVAL_HOURS: "6"
-      MAX_PER_CYCLE: "8"               # caps cloud spend per cycle
+      MAX_PER_CYCLE: "8"               # caps Claude usage per cycle
       FIT_THRESHOLD: "70"
       HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
     volumes:
       - ./:/app
-    networks: [desk]
     healthcheck:                       # unhealthy if the heartbeat is older than 2h (it refreshes every 30m)
       test: ["CMD", "python", "-c", "import json,datetime as d,sys; s=json.load(open('build/.nas_state.json')); sys.exit((d.datetime.now()-d.datetime.fromisoformat(s['heartbeat'])).total_seconds()>7200)"]
       interval: 10m
       timeout: 20s
       start_period: 3h                 # the first sweep can take a while before anything is written
       retries: 2
-
-networks:
-  desk:                                # the trading-desk project's default network, where trading-ollama lives
-    external: true
-    name: trading-desk_default

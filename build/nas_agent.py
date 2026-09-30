@@ -1,4 +1,4 @@
-"""Always-on job watcher for the NAS: sweep, judge fit with Ollama Cloud, draft documents, ping Telegram.
+"""Always-on job watcher for the NAS: sweep, judge fit with Claude (`claude -p`), draft documents, ping Telegram.
 
     python build/nas_agent.py          # loop forever (the container's entrypoint)
     python build/nas_agent.py --once   # one cycle, then exit
@@ -22,7 +22,12 @@ the vault — the NAS copy of the vault would drift from the OneDrive one.
 The state file also carries a heartbeat, rewritten every HEARTBEAT_MIN minutes while idle, so an
 outside watchdog (or the compose healthcheck) can tell "alive but nothing new" from "down".
 
-Env: OLLAMA_BASE_URL, JOB_MODEL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID, SWEEP_INTERVAL_HOURS,
+The model is called through the Claude Code CLI in print mode (`claude -p`), with every tool disabled,
+no MCP servers, no settings files and an empty working directory: it can only read the prompt and
+answer. Auth comes from CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, uses the subscription) or
+ANTHROPIC_API_KEY. The verdict is enforced with --json-schema, so there is no JSON to hand-parse.
+
+Env: CLAUDE_BIN, JOB_MODEL, CLAUDE_TIMEOUT, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID, SWEEP_INTERVAL_HOURS,
      MAX_PER_CYCLE, FIT_THRESHOLD, HEARTBEAT_MIN.
 """
 from __future__ import annotations
@@ -32,7 +37,9 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.parse
@@ -48,15 +55,16 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "build" / ".nas_state.json"
 OUT = ROOT / "tailored-auto"
 
-OLLAMA = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-MODEL = os.environ.get("JOB_MODEL", "deepseek-v4.1-flash:cloud")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+MODEL = os.environ.get("JOB_MODEL", "sonnet")  # any `claude --model` value: sonnet, opus, haiku or a full id
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 INTERVAL_H = float(os.environ.get("SWEEP_INTERVAL_HOURS", "6"))
 # ponytail: caps cloud spend per cycle; the rest stay unseen and roll into the next cycle.
 MAX_PER_CYCLE = int(os.environ.get("MAX_PER_CYCLE", "8"))
 FIT_THRESHOLD = int(os.environ.get("FIT_THRESHOLD", "70"))
 HEARTBEAT_MIN = float(os.environ.get("HEARTBEAT_MIN", "30"))
 # A posting whose verdict keeps failing to parse is given up after this many cycles instead of
-# eating a MAX_PER_CYCLE slot forever. Network errors (Ollama down) never count against it.
+# eating a MAX_PER_CYCLE slot forever. CLI, auth and network errors never count against it.
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 PERMANENT = (ValueError, KeyError, TypeError)  # json.JSONDecodeError is a ValueError
 SEEN_DAYS = int(os.environ.get("SEEN_DAYS", "180"))  # forget postings older than this
@@ -85,7 +93,7 @@ Min years: {years}
 Description:
 {desc}
 
-Return ONLY a JSON object:
+Answer with these fields:
 {{"suitable": bool, "score": 0-100 fit to the candidate's current role, "reason": "one sentence",
   "gaps": "the honest gaps, one sentence", "coding_test_risk": "low|medium|high",
   "tagline": "resume tagline for this role, pipe-separated like the candidate's",
@@ -107,11 +115,58 @@ def profile() -> str:
             + "; ".join(MASTER["certifications"]))
 
 
-def _post(url: str, payload: dict, timeout: int = 300) -> dict:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+class ClaudeError(RuntimeError):
+    """The CLI failed (not installed, not signed in, rate-limited, offline). Transient: retried next cycle."""
+
+
+COST = {"usd": 0.0}  # running total for the current cycle; reset by cycle()
+
+
+def claude(prompt: str, schema: dict | None = None):
+    """One `claude -p` call. Returns the schema-validated object when `schema` is given, else the text."""
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
+           "--no-session-persistence", "--strict-mcp-config", "--setting-sources", ""]
+    if schema:
+        cmd += ["--json-schema", json.dumps(schema)]
+    # An empty cwd keeps the project folder (and .env) out of reach even if a posting tries prompt injection.
+    with tempfile.TemporaryDirectory() as cwd:
+        try:
+            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd,
+                                  timeout=CLAUDE_TIMEOUT)
+        except FileNotFoundError as exc:
+            raise ClaudeError(f"{CLAUDE_BIN} not found — is the Claude Code CLI installed?") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ClaudeError(f"claude -p timed out after {CLAUDE_TIMEOUT}s") from exc
+    try:
+        out = json.loads(proc.stdout)
+    except ValueError:
+        raise ClaudeError(f"claude -p exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[-300:]}")
+    COST["usd"] += out.get("total_cost_usd") or 0
+    if out.get("is_error") or out.get("subtype") != "success":
+        raise ClaudeError(f"claude -p: {out.get('subtype')}: {str(out.get('result'))[:300]}")
+    if schema:
+        verdict = out.get("structured_output")
+        if not isinstance(verdict, dict):  # the model's reply, not the CLI: counts toward MAX_ATTEMPTS
+            raise ValueError(f"no structured output: {str(out.get('result'))[:200]}")
+        return verdict
+    return (out.get("result") or "").strip()
+
+
+def claude_ok() -> str:
+    try:
+        v = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=30)
+        return v.stdout.strip() or f"exit {v.returncode}"
+    except Exception as exc:
+        return f"UNAVAILABLE: {exc}"
+
+
+def verdict_schema() -> dict:
+    s, arr = {"type": "string"}, lambda item: {"type": "array", "items": item}
+    props = {"suitable": {"type": "boolean"}, "score": {"type": "integer", "minimum": 0, "maximum": 100},
+             "reason": s, "gaps": s, "coding_test_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+             "tagline": s, "summary": s, "projects": arr({"type": "string", "enum": PROJECTS}),
+             "employer": s, "letter": arr(s)}
+    return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
 def description(rec: dict) -> str:
@@ -133,11 +188,8 @@ def judge(rec: dict) -> dict:
                            excluded=sweep.profile.EXCLUDED_EMPLOYERS_TEXT, profile=profile(), title=rec["title"], company=rec["company"], pay=pay,
                            years=rec.get("years") or "n/s", desc=rec.get("desc") or description(rec),
                            projects=PROJECTS)
-    # think=False: on reasoning models the thinking otherwise eats the reply and content comes back empty.
-    resp = _post(f"{OLLAMA}/api/chat", {"model": MODEL, "stream": False, "format": "json", "think": False,
-                                        "messages": [{"role": "user", "content": prompt}]})
-    verdict = json.loads(resp["message"]["content"])
-    # The model only gets to pick from the real project library; anything else is dropped.
+    verdict = claude(prompt, verdict_schema())
+    # The schema already restricts projects to the real library; this is the belt to its braces.
     picks = [p for p in verdict.get("projects") or [] if p in PROJECTS]
     verdict["projects"] = picks or PROJECTS[:4]
     return verdict
@@ -217,6 +269,7 @@ def cycle() -> None:
     seen = state["seen"]
     prune(state)
     state["last_cycle_start"] = _now()
+    COST["usd"] = 0.0
     save_state(state)
     jobs = candidates()
     ident = lambda r: r.get("uuid") or r["id"]  # noqa: E731
@@ -265,10 +318,11 @@ def cycle() -> None:
     _finish(state, {"candidates": len(jobs), "new": len(new), "judged": judged, "fits": fits,
                     "failed": failed, "note": last_fail[:300]})
     if failed and not judged:
-        # Every judge call failed: usually trading-ollama is down or off the network. Say so instead of
+        # Every judge call failed: usually the CLI is signed out, rate-limited or offline. Say so instead of
         # silently retrying forever.
         telegram(f"⚠️ Job watcher: all {failed} judge calls failed ({last_fail[:200]}). "
-                 f"Is trading-ollama running? Postings stay unseen and retry next cycle.")
+                 f"Check the Claude login (CLAUDE_CODE_OAUTH_TOKEN) or limits. Postings stay unseen and retry "
+                 f"next cycle.")
 
 
 def prune(state: dict) -> None:
@@ -286,6 +340,7 @@ def prune(state: dict) -> None:
 def _finish(state: dict, run: dict) -> None:
     """Every cycle leaves a record, even one with nothing new, so 'quiet' is visible as 'alive'."""
     run["at"] = _now()
+    run["cost_usd"] = round(COST["usd"], 4)
     state["last_cycle"] = run["at"]
     state["runs"] = (state.get("runs") or [])[-29:] + [run]
     state.pop("last_error", None)
@@ -344,24 +399,16 @@ def status_text(state: dict) -> str:
     runs = state.get("runs") or []
     lines = [f"Heartbeat: {_age(state.get('heartbeat'))}",
              f"Last cycle finished: {_age(state.get('last_cycle'))} (every {INTERVAL_H:g}h)",
-             f"Model: {MODEL} via {OLLAMA} ({ollama_ok()})",
+             f"Model: {MODEL} via claude -p ({claude_ok()})",
              f"Postings tracked: {len(state.get('seen', {}))}"]
     if state.get("last_error"):
         e = state["last_error"]
         lines.append(f"Last error {_age(e.get('at'))}: {e.get('error', '')[-400:]}")
     for r in runs[-5:]:
         lines.append(f"- {r.get('at', '?')[5:16]}: {r.get('candidates')} cand, {r.get('new')} new, "
-                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('failed')} failed"
+                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('failed')} failed, ${r.get('cost_usd', 0):.2f}"
                      + (f" ({r['note']})" if r.get("note") else ""))
     return "\n".join(lines)
-
-
-def ollama_ok() -> str:
-    try:
-        with urllib.request.urlopen(f"{OLLAMA}/api/version", timeout=10) as r:
-            return "reachable, v" + json.load(r).get("version", "?")
-    except Exception as exc:
-        return f"UNREACHABLE: {exc}"
 
 
 def ask(question: str) -> str:
@@ -374,9 +421,7 @@ def ask(question: str) -> str:
     drafts_txt = "\n\n".join(f.read_text(encoding="utf-8")[:800] for f in drafts) or "(none yet)"
     prompt = ASK_PROMPT.format(today=dt.date.today(), profile=profile(), status=status_text(state),
                                judged=judged_txt, drafts=drafts_txt, question=question)
-    resp = _post(f"{OLLAMA}/api/chat", {"model": MODEL, "stream": False, "think": False,
-                                        "messages": [{"role": "user", "content": prompt}]})
-    return (resp.get("message", {}).get("content") or "").strip() or "(the model returned nothing)"
+    return claude(prompt) or "(the model returned nothing)"
 
 
 MCF_UUID = re.compile(r"([0-9a-f]{32})")

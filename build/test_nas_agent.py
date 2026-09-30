@@ -1,5 +1,5 @@
 """Offline tests for the NAS loop, the Telegram commands and the watchdog. No network: Telegram,
-Ollama and MyCareersFuture are replaced by a fake urlopen.
+`claude -p` and MyCareersFuture are faked (urlopen and subprocess.run).
 
     python build/test_nas_agent.py
 """
@@ -9,6 +9,7 @@ import datetime as dt
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -44,13 +45,6 @@ def fake_urlopen(req, data=None, timeout=0):
     if "getUpdates" in url:
         out, UPDATES[:] = list(UPDATES), []
         return Resp(json.dumps({"result": out}).encode())
-    if "/api/version" in url:
-        return Resp(b'{"version":"0.9"}')
-    if "/api/chat" in url:
-        body = json.loads(req.data)
-        if "format" in body:  # judge
-            return Resp(json.dumps({"message": {"content": json.dumps(VERDICT)}}).encode())
-        return Resp(b'{"message":{"content":"Role X fits best."}}')
     if "mycareersfuture" in url and url.rstrip("/").endswith("a" * 32):
         return Resp(json.dumps({"title": "Platform Engineer", "hiringCompany": {"name": "Acme"},
                                 "salary": {"minimum": 9000, "maximum": 12000}, "description": "<p>k8s</p>",
@@ -60,7 +54,26 @@ def fake_urlopen(req, data=None, timeout=0):
     raise AssertionError(f"unexpected URL {url}")
 
 
+CALLS: list[list[str]] = []
+
+
+def fake_run(cmd, input=None, cwd=None, **kw):
+    """Stands in for the claude CLI: --version, a schema'd judge call, or a plain /ask."""
+    CALLS.append(cmd)
+    if cmd[1:] == ["--version"]:
+        return subprocess.CompletedProcess(cmd, 0, "2.1.0 (Claude Code)", "")
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "", "tools must be disabled"
+    assert cwd and not os.listdir(cwd), "must run in an empty directory"
+    out = {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}
+    if "--json-schema" in cmd:
+        out.update(result=json.dumps(VERDICT), structured_output=VERDICT)
+    else:
+        out["result"] = "Role X fits best." if "which fits best?" in input else "?"
+    return subprocess.CompletedProcess(cmd, 0, json.dumps(out), "")
+
+
 a.urllib.request.urlopen = fake_urlopen
+a.subprocess.run = fake_run
 a.build = lambda rec, v: TMP / "draft"  # document rendering has its own checks
 CHECKS: list[tuple[str, bool]] = []
 
@@ -92,15 +105,35 @@ a.candidates = lambda: [rec("j1"), rec("j2")]
 SENT.clear()
 a.cycle()
 check("a fitting new posting is alerted", any("SRE j2" in s for s in SENT))
+check("the cycle's claude cost is recorded", a.load_state()["runs"][-1]["cost_usd"] == 0.01)
+check("the verdict schema pins projects to the real library",
+      a.verdict_schema()["properties"]["projects"]["items"]["enum"] == a.PROJECTS)
+
+# --- claude -p error handling ---------------------------------------------------------------------
+a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "Invalid API key · Please run /login")
+try:
+    a.claude("x")
+    check("a signed-out CLI raises ClaudeError", False)
+except a.ClaudeError as exc:
+    check("a signed-out CLI raises ClaudeError", "Invalid API key" in str(exc))
+check("ClaudeError is transient (never counts toward MAX_ATTEMPTS)", not issubclass(a.ClaudeError, a.PERMANENT))
+a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+    cmd, 0, json.dumps({"subtype": "success", "is_error": False, "result": "nope"}), "")
+try:
+    a.claude("x", {"type": "object"})
+    check("missing structured output is a permanent error", False)
+except a.PERMANENT:
+    check("missing structured output is a permanent error", True)
+a.subprocess.run = fake_run
 
 real_judge = a.judge
 a.candidates = lambda: [rec("j3")]
-a.judge = lambda r: (_ for _ in ()).throw(ConnectionError("refused"))
+a.judge = lambda r: (_ for _ in ()).throw(a.ClaudeError("rate limited"))
 SENT.clear()
 for _ in range(a.MAX_ATTEMPTS + 1):
     a.cycle()
-check("network failures warn on Telegram", any("judge calls failed" in s for s in SENT))
-check("network failures never give up", "j3" not in a.load_state()["seen"])
+check("CLI failures warn on Telegram", any("judge calls failed" in s for s in SENT))
+check("CLI failures never give up", "j3" not in a.load_state()["seen"])
 
 a.judge = lambda r: (_ for _ in ()).throw(json.JSONDecodeError("bad", "", 0))
 for _ in range(a.MAX_ATTEMPTS):
@@ -130,6 +163,7 @@ UPDATES[:] = [msg(5, "/status", thread=7), msg(6, "/status", chat=99), msg(7, "/
 check("/sweep asks for a cycle", a.poll_commands(a.load_state(), 1) is True)
 check("update offset persisted", a.load_state()["tg_offset"] == 11)
 check("/status answers in the asking topic", "message_thread_id=7" in SENT[0] and "Heartbeat" in SENT[0])
+check("/status shows the claude CLI version", "2.1.0 (Claude Code)" in SENT[0])
 check("strangers are ignored", sum("Heartbeat" in s for s in SENT) == 1)
 check("/ask returns the model's answer", any("Role X fits best." in s for s in SENT))
 check("/judge reads MCF via the API", any("Platform Engineer" in s and "$9,000" in s for s in SENT))

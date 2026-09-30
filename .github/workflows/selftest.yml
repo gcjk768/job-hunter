@@ -17,3 +17,12 @@ jobs:
         run: python build/selftest.py
       - name: NAS loop, Telegram commands, watchdog (offline)
         run: python build/test_nas_agent.py
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the NAS image (python-docx + claude CLI)
+        run: docker build -t job-hunter:ci deploy/nas
+      - name: Offline tests inside the image
+        run: docker run --rm -v "$PWD:/app" job-hunter:ci sh -c "claude --version && python build/selftest.py && python build/test_nas_agent.py"

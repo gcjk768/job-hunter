@@ -4,11 +4,13 @@ A job-search agent that runs 24/7 on my home NAS. It sweeps Singapore job boards
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Ollama](https://img.shields.io/badge/LLM-Ollama-000000?logo=ollama&logoColor=white)
+![Claude](https://img.shields.io/badge/LLM-Claude%20(claude%20--p)-D97757?logo=anthropic&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Alerts-Telegram-26A5E4?logo=telegram&logoColor=white)
 ![Self-test](https://img.shields.io/badge/selftest-14%20checks-brightgreen)
 
 ![Architecture](docs/architecture.drawio.svg)
+
+<sub>The diagram still shows the earlier Ollama backend; the judge now runs through `claude -p` (steps 4–5 below).</sub>
 
 <sub>Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) · PNG fallback: [`docs/architecture.png`](docs/architecture.png)</sub>
 
@@ -19,11 +21,11 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 ## Highlights
 
 - **The human stays in control, by design.** The agent can only write local `.docx` drafts and send one Telegram message. No code path submits an application. Every alert ends with "Nothing was submitted — your call." (`build/nas_agent.py`)
-- **The LLM can only pick from real data.** It returns a strict JSON verdict (`format: json`). The projects it chooses are checked against the real project library, and any name it invents is dropped (`judge()` in `build/nas_agent.py`). The prompt also forbids inventing employers, numbers, certifications or years.
+- **The LLM can only pick from real data.** The verdict is enforced by `claude -p --json-schema`, and the schema's project list is an `enum` of the real project library, re-checked in code (`judge()` in `build/nas_agent.py`). The prompt also forbids inventing employers, numbers, certifications or years.
 - **Deterministic filters run before the LLM.** Regexes cut role shape, seniority, pay floor, excluded employers and public-sector/defence work before a single token is spent (`build/weekly_sweep.py`). The model only sees candidates that already pass. That keeps cost down and makes the hard rules auditable.
 - **Cost is capped and nothing gets lost.** `MAX_PER_CYCLE` (default 8) limits LLM calls per cycle. Postings over the cap, and any whose judge call fails, stay *unseen* and are retried next cycle rather than dropped. The first run only records a baseline, so turning it on doesn't flood you with every live posting.
-- **One copy of the cloud credential.** The container joins the Docker network of an Ollama container that's already signed in (`http://trading-ollama:11434`), so the Ollama Cloud key is never copied a second time (`deploy/nas/compose.yaml`).
-- **`think: false` on every call.** With `format: json`, reasoning models otherwise spend the whole reply on thinking and return empty content. Found while testing against a local `qwen3.6`.
+- **The model can read, not act.** Every `claude -p` call runs with `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` and an empty temp directory as its working directory. A job posting that tries prompt injection has no tools and no project files (or `.env`) within reach.
+- **Failures are classified.** A CLI, auth, rate-limit or network failure (`ClaudeError`) is transient and retried next cycle forever. A reply without a valid structured verdict counts toward `MAX_ATTEMPTS`.
 - **The self-test checks behaviour, not syntax.** A `\b` written through a shell heredoc once collapsed into a literal backspace byte, and a filter silently matched nothing. `build/selftest.py` asserts 14 filter behaviours and scans the source for any C0 control character.
 - **Personal data stays out of git by default.** `.gitignore` is a *whitelist*: resume content (`content.py`), personal filters (`my_profile.py`), state, `.env` and generated documents are private unless someone deliberately publishes them. Example stand-ins (`*_example.py`) keep the repo runnable.
 
@@ -34,8 +36,8 @@ Numbers match the diagram.
 1. **Sweep.** `weekly_sweep.collect()` queries the MyCareersFuture public API (20 search terms × 4 pages). It's the only source that publishes a salary band and a minimum-years figure. `job_sources.fetch_all()` adds company boards: 26 Greenhouse, 6 Ashby, 7 Lever, plus amazon.jobs, Workday tenants, NVIDIA's Workday site (Singapore facet) and, optionally, Apple via headless Playwright. The regex filters and the pay floor are applied here.
 2. **Dedup.** Each posting's ID is checked against `build/.nas_state.json`. Only IDs not seen before continue.
 3. **Cap.** At most `MAX_PER_CYCLE` new postings go to the model.
-4. **Judge.** `judge()` fetches the job description (MCF only; career pages are judged on title and company) and calls Ollama `/api/chat` with `format=json, think=false`. The verdict covers: suitable, 0–100 score, reason, honest gaps, coding-test risk, tagline, summary, project picks and cover-letter paragraphs.
-5. **Inference.** The shared Ollama container forwards the call to Ollama Cloud (default model `deepseek-v4.1-flash:cloud`).
+4. **Judge.** `judge()` fetches the job description (MCF only; career pages are judged on title and company) and calls `claude -p --output-format json --json-schema <verdict schema>`. The verdict covers: suitable, 0–100 score, reason, honest gaps, coding-test risk, tagline, summary, project picks and cover-letter paragraphs.
+5. **Inference.** The Claude Code CLI in the container calls Claude (default `sonnet`), authenticated with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (subscription) or `ANTHROPIC_API_KEY`. Each run records its `total_cost_usd`.
 6. **Gate.** The posting has to be `suitable`, score ≥ `FIT_THRESHOLD` (70), and come with a letter.
 7. **Draft.** `build_docs.py` renders an ATS-plain resume and cover letter plus a `fit.md` into `tailored-auto/<date_company_role>/`.
 8. **Alert.** One Telegram message goes to a forum topic with the role, pay, score, reasons, gaps, URL and the path to the draft folder.
@@ -47,16 +49,17 @@ Numbers match the diagram.
 |---|---|
 | Language | Python 3.12, stdlib `urllib` (no HTTP client dependency) |
 | Documents | `python-docx`: single-column, no tables or text boxes, real bullet lists (ATS-friendly) |
-| LLM | Ollama `/api/chat` with JSON mode, via Ollama Cloud |
+| LLM | Claude via the Claude Code CLI (`claude -p`, `--json-schema` structured output, tools disabled) |
 | Sources | MyCareersFuture API, Greenhouse / Ashby / Lever / Workday JSON endpoints, amazon.jobs, Playwright (Apple, optional) |
 | Alerts | Telegram Bot API (forum topics via `message_thread_id`) |
-| Runtime | Docker Compose on a home NAS (`python:3.12-slim`, `restart: unless-stopped`) |
+| Runtime | Docker Compose on a home NAS (`python:3.12-slim-bookworm` + Node 22 + `@anthropic-ai/claude-code`, `restart: unless-stopped`) |
 | State | JSON file (`build/.nas_state.json`) |
 
 ## Getting started
 
 ```bash
 pip install python-docx
+npm install -g @anthropic-ai/claude-code             # then `claude` once to sign in, or set CLAUDE_CODE_OAUTH_TOKEN
 cp build/content_example.py build/content.py        # your resume (gitignored)
 cp build/my_profile_example.py build/my_profile.py  # pay floor + excluded employers (gitignored)
 python build/selftest.py
@@ -67,8 +70,10 @@ Environment (put the secrets in `.env`, which is never committed):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
-| `JOB_MODEL` | `deepseek-v4.1-flash:cloud` | Model used as the fit judge |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Claude login for the container (`claude setup-token`); or set `ANTHROPIC_API_KEY` |
+| `JOB_MODEL` | `sonnet` | Any `claude --model` value (`haiku`, `sonnet`, `opus` or a full model ID) |
+| `CLAUDE_BIN` | `claude` | Path to the CLI |
+| `CLAUDE_TIMEOUT` | `300` | Seconds per `claude -p` call |
 | `TELEGRAM_BOT_TOKEN` | — | Bot token (if unset, alerts are printed to stdout instead) |
 | `TELEGRAM_CHAT_ID` | — | Target chat |
 | `TELEGRAM_THREAD_ID` | — | Optional forum topic |
@@ -85,7 +90,7 @@ Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_
 
 | Command | What it does |
 |---|---|
-| `/status` | Heartbeat, last cycle, Ollama reachability, last 5 runs, last error. No LLM call. |
+| `/status` | Heartbeat, last cycle, `claude` CLI version, last 5 runs with cost, last error. No LLM call. |
 | `/ask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
 | `/judge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
 | `/sweep` | Runs a cycle now. |
@@ -95,15 +100,15 @@ Only one process may call `getUpdates` per bot token, so nothing else should pol
 
 ### Health
 
-Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually because `trading-ollama` is down), you get a Telegram warning instead of silent retries.
+Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually the Claude login expired or a usage limit was hit), you get a Telegram warning instead of silent retries.
 
 - **Restarts don't re-sweep.** On start the loop waits until the next cycle is due, based on `last_cycle`, so a NAS reboot doesn't trigger a paid sweep. `/sweep` still forces one.
-- **Retries are bounded.** A posting whose verdict can't be parsed is given up after `MAX_ATTEMPTS` cycles. Network errors (Ollama down) never count, so nothing is lost to an outage.
+- **Retries are bounded.** A posting whose verdict can't be parsed is given up after `MAX_ATTEMPTS` cycles. CLI, auth and network errors never count, so nothing is lost to an outage.
 - **Watchdog on the PC.** `build/watchdog.py` reads the Syncthing copy of the state file and messages Telegram once when the watcher goes quiet (heartbeat over `WATCHDOG_MAX_H`, default 2h), when it's alive but sweeps are stuck (no finished cycle in 2 × interval + 1h), or when the last cycle crashed. It sends one 🟢 message on recovery. Schedule `python build\watchdog.py` every 15 minutes in Task Scheduler; set `JOB_STATE` if the synced file isn't at `build/.nas_state.json`.
 
 ### On a NAS (Docker)
 
-`deploy/nas/compose.yaml` builds a small image from `deploy/nas/Dockerfile` (`python:3.12-slim` + `python-docx`, installed once at build time) and mounts the project folder. Put `compose.yaml`, `Dockerfile`, `.env` and `build/` in the share and create the project. After a code-only change, copy `build/*.py` and restart; rebuild only when the Dockerfile changes. It expects an existing Ollama container on an external Docker network, so change `networks.desk.name` and `OLLAMA_BASE_URL` to match your setup.
+`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the project folder. Put `compose.yaml`, `Dockerfile`, `.env` and `build/` in the share and create the project. After a code-only change, copy `build/*.py` and restart; rebuild only when the Dockerfile changes. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude.
 
 ## Project structure
 
@@ -125,8 +130,8 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 7 files clean of control chars`.
-- `python build/test_nas_agent.py` runs offline checks of the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling), every Telegram command and the watchdog, with Telegram, Ollama and MyCareersFuture faked.
-- GitHub Actions runs both on every push (`.github/workflows/selftest.yml`).
+- `python build/test_nas_agent.py` runs offline checks of the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling), every Telegram command and the watchdog, with Telegram, `claude -p` and MyCareersFuture faked.
+- GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations
 
