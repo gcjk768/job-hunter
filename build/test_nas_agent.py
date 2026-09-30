@@ -36,6 +36,8 @@ EXTRACTED = {"jobs": [
      "url": "https://www.linkedin.com/comm/jobs/view/4099999999/", "salary": ""},
     {"title": "Junior DevOps Engineer", "company": "Hooli", "location": "Singapore", "snippet": "",
      "url": "https://www.linkedin.com/comm/jobs/view/4077777777/", "salary": "S$1,200 - S$1,500 / month"}]}
+HEAL_REPLY = {"diagnosis": "The board API timed out twice.", "cause": "transient",
+              "actions": ["none"], "user_steps": "", "patch": ""}  # benign unless a test says otherwise
 FACTCHECK = {"issues": ["'10 years of Kubernetes' -> removed, the resume shows 4"], "tagline": "t",
              "summary": "s", "outreach": "Checked note.", "letter": ["checked p1", "checked p2"]}
 
@@ -90,7 +92,8 @@ def fake_run(cmd, input=None, cwd=None, **kw):
     out = {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}
     if "--json-schema" in cmd:
         schema = cmd[cmd.index("--json-schema") + 1]
-        got = EXTRACTED if '"jobs"' in schema else FACTCHECK if '"issues"' in schema else VERDICT
+        got = (EXTRACTED if '"jobs"' in schema else FACTCHECK if '"issues"' in schema
+               else HEAL_REPLY if '"diagnosis"' in schema else VERDICT)
         out.update(result=json.dumps(got), structured_output=got)
     elif "which fits best?" in input:
         out["result"] = "Role X fits best."
@@ -473,6 +476,212 @@ except SystemExit as exc:
     check("--selfcheck exits non-zero on problems", exc.code == 1)
 sys.argv = ["test"]
 os.environ.pop("IMAP_USER")
+
+# --- one bad reply only costs that board / page ------------------------------------------------
+import http.client  # noqa: E402
+
+real_get = job_sources._get
+boards = []
+
+
+def flaky_get(url, data=None):
+    boards.append(url)
+    if len(boards) == 1:
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")  # a non-JSON reply
+    if len(boards) == 2:
+        raise http.client.RemoteDisconnected("Remote end closed connection")
+    return {"jobs": [{"id": 1, "title": "Site Reliability Engineer", "location": {"name": "Singapore"},
+                      "absolute_url": f"https://x/{len(boards)}"}]}
+
+
+job_sources._get = flaky_get
+got = job_sources.greenhouse(a.sweep.TITLE_KEEP, log=lambda *x: None)
+job_sources._get = real_get
+check("a garbled or dropped Greenhouse reply skips only that board",
+      len(boards) == len(job_sources.GREENHOUSE) and len(got) == len(job_sources.GREENHOUSE) - 2)
+real_fetch_mcf = a.sweep.fetch
+a.sweep.fetch = lambda search, page: (_ for _ in ()).throw(http.client.RemoteDisconnected("closed"))
+try:
+    check("a dropped MyCareersFuture connection doesn't crash the sweep", a.sweep.collect() == {})
+except Exception:
+    check("a dropped MyCareersFuture connection doesn't crash the sweep", False)
+a.sweep.fetch = real_fetch_mcf
+
+# --- staying alive -------------------------------------------------------------------------------
+EXITS: list[int] = []
+SLEEPS: list[float] = []
+a.EXIT = EXITS.append
+a.SLEEP = SLEEPS.append
+real_state = a.STATE
+iso = Path(tempfile.mkdtemp())
+a.STATE = iso / "build" / ".nas_state.json"
+a.STATE.parent.mkdir()
+(a.STATE.parent / "backups").mkdir()
+(a.STATE.parent / "backups" / "nas_state-2026-09-01.json").write_text('{"seen": {"old": {"t": "x"}}}')
+(a.STATE.parent / "backups" / "nas_state-2026-09-02.json").write_text('{"seen": {"good": {"t": "y"}}, "next_ref": 4}')
+(a.STATE.parent / "backups" / "nas_state-2026-09-03.json").write_text('{"seen": {"trunc')
+a.STATE.write_text('{"seen": {"half-writ')
+SENT.clear()
+st = a.load_state()
+check("an unreadable state file is restored from the newest backup that parses",
+      "good" in st["seen"] and st["restored"]["from"] == "backup nas_state-2026-09-02.json"
+      and any("🩹 The state file couldn't be read" in s for s in SENT)
+      and list(a.STATE.parent.glob(".nas_state.broken-*.json")))
+check("the restored state is saved, so the next load is clean", "restored" in json.loads(a.STATE.read_text()))
+for b in (a.STATE.parent / "backups").glob("*.json"):
+    b.unlink()
+a.STATE.write_text("garbage")
+st = a.load_state()
+check("with no usable backup it starts fresh instead of crashing", st["seen"] == {} and "fresh" in st["restored"]["from"])
+a.STATE.write_text('["not", "a", "state"]')
+check("valid JSON of the wrong shape is treated as broken too", a.load_state()["seen"] == {})
+
+saved_state_path = a.STATE
+a.STATE = Path("/nonexistent-dir/state.json")
+try:
+    a.save_state({"seen": {}})
+    check("a failed save (disk full, read-only) is logged, not raised", True)
+except OSError:
+    check("a failed save (disk full, read-only) is logged, not raised", False)
+a.STATE = saved_state_path
+
+a.PROGRESS["t"] = a.time.time()
+check("no restart while the loop is making progress", not a.stall_check() and not EXITS)
+a.PROGRESS["t"] = a.time.time() - (a.STALL_MIN + 5) * 60
+SENT.clear()
+check("a stalled loop restarts the process", a.stall_check() and EXITS == [3]
+      and any("restarting itself" in s for s in SENT) and a.load_state()["stalled"]["minutes"] >= a.STALL_MIN)
+EXITS.clear()
+a.PROGRESS["t"] = a.time.time()
+
+HEALS: list[tuple] = []
+real_heal = a.heal
+a.heal = lambda trigger, error, **k: HEALS.append((trigger, error)) or True
+a.startup_checks()
+check("the first start after a stall asks for a diagnosis", HEALS and HEALS[-1][0] == "restarted after a stall")
+st = a.load_state()
+st["starts"] = [a._now()] * 5
+a.save_state(st)
+HEALS.clear()
+SLEEPS.clear()
+a.startup_checks()
+check("a crash loop backs off 10 minutes and is diagnosed", SLEEPS == [600] and HEALS[0][0].startswith("crash loop"))
+
+SLEEPS.clear()
+HEALS.clear()
+check("guarded() turns an exception into a recorded error and a heal",
+      a.guarded(lambda: 1 / 0) is False and "ZeroDivisionError" in a.load_state()["last_error"]["error"]
+      and HEALS and SLEEPS == [60])
+
+
+class Stop(BaseException):
+    pass
+
+
+calls = {"cycle": 0, "idle": 0}
+real = (a.cycle, a.idle, a.start_watchdog, a.startup_checks)
+
+
+def bad_cycle():
+    calls["cycle"] += 1
+    raise RuntimeError("boom")
+
+
+def bad_idle(seconds):
+    calls["idle"] += 1
+    if calls["idle"] >= 3:
+        raise Stop()
+    raise OSError("idle broke")
+
+
+a.cycle, a.idle, a.start_watchdog, a.startup_checks = bad_cycle, bad_idle, lambda: None, lambda: None
+sys.argv = ["nas_agent.py"]
+st = a.load_state()
+st.pop("last_cycle", None)
+a.save_state(st)
+try:
+    a.main()
+except Stop:
+    pass
+a.cycle, a.idle, a.start_watchdog, a.startup_checks = real
+check("the main loop survives failing sweeps and a failing idle loop", calls == {"cycle": 3, "idle": 3})
+a.heal = real_heal
+
+# --- self-repair ----------------------------------------------------------------------------------
+st = a.load_state()
+st.update(attempts={"p1": 2, "p2": 1}, heals=[])
+a.save_state(st)
+(a.STATE.parent / "backups").mkdir(exist_ok=True)
+SENT.clear()
+CALLS.clear()
+HEAL_REPLY.update(actions=["clear_retry_counters", "wait_and_retry", "pause_mail_24h"],
+                  patch="--- a/build/x.py\n+++ b/build/x.py\n@@ -1 +1 @@\n-a\n+b")
+err = 'Traceback (most recent call last):\n  File "/app/build/nas_agent.py", line 30, in cycle\nTimeoutError: timed out'
+check("heal() reports a diagnosis", a.heal("sweep raised", err) and any("🩹 Self-heal: sweep raised" in s
+                                                                     and "board API timed out" in s for s in SENT))
+st = a.load_state()
+check("heal() applies the chosen safe remedies", st["attempts"] == {} and a.backoff_left(st) > 3000
+      and a._hours_since(st["mail_paused_until"]) < -23)
+patches = list((a.STATE.parent / "patches").glob("*.diff"))
+check("a proposed code fix is saved, not applied", len(patches) == 1 and any("NOT applied" in s for s in SENT))
+check("the same failure isn't diagnosed twice in 6h", a.heal("sweep raised", err) is False)
+check("…unless forced (/heal)", a.heal("sweep raised", err, force=True) is True)
+os.environ["IMAP_USER"] = "me@gmail.com"
+check("a paused mail reader reads nothing", a.mail_jobs(a.load_state()) == [])
+os.environ.pop("IMAP_USER")
+
+SENT.clear()
+CALLS.clear()
+check("a login failure gets fixed guidance without asking Claude",
+      a.heal("every judge call in a sweep failed", "ClaudeError: Invalid API key · Please run /login")
+      and any("claude setup-token" in s for s in SENT) and not CALLS)
+
+HEAL_REPLY.update(actions=["restart_process"], patch="")
+check("restart_process exits so Docker restarts it", a.heal("idle raised", "x = broken state 1", force=True)
+      and EXITS == [3])
+EXITS.clear()
+st = a.load_state()
+st["heals"] = [{"sig": str(i), "at": a._now()} for i in range(a.HEAL_MAX_PER_DAY)]
+a.save_state(st)
+check("self-heal is capped per day", a.heal("new failure", "something else", force=True) is False)
+st["heals"] = []
+a.save_state(st)
+
+(a.STATE.parent / "backups" / "nas_state-2026-09-05.json").write_text('{"seen": {"from-backup": {"t": "z"}}}')
+check("restore_state_from_backup swaps in the backup and keeps the old file",
+      a.apply_remedy("restore_state_from_backup") and "from-backup" in a.load_state()["seen"]
+      and list(a.STATE.parent.glob(".nas_state.replaced-*.json")))
+UPDATES[:] = [msg(700, "old queued message")]
+check("reset_telegram_offset skips the queue", a.apply_remedy("reset_telegram_offset")
+      and a.load_state()["tg_offset"] == 701)
+UPDATES[:] = []
+st = a.load_state()
+st["attempts"] = {"poison": 2}
+a.save_state(st)
+a.apply_remedy("skip_failing_postings")
+check("skip_failing_postings marks them seen", a.load_state()["seen"]["poison"]["gave_up"] == "skipped by self-heal")
+check("the code around the failure is sent to the diagnosis",
+      "def " in a._code_context(f'File "{Path(a.__file__).resolve()}", line 150, in claude') or
+      "line 150" in a._code_context(f'File "{Path(a.__file__).resolve()}", line 150, in claude'))
+
+st = a.load_state()
+st["last_error"] = {"at": a._now(), "error": "TimeoutError: board timed out"}
+st["heals"] = []
+a.save_state(st)
+HEAL_REPLY.update(actions=["none"])
+SENT.clear()
+UPDATES[:] = [msg(800, "/heal")]
+a.poll_commands(a.load_state(), 1)
+check("/heal diagnoses the last recorded error", any("🩹 Self-heal: manual /heal" in s for s in SENT))
+real_tg = a.telegram
+a.telegram = lambda *x, **k: (_ for _ in ()).throw(OSError("telegram down"))
+try:
+    check("a Telegram outage during self-heal is logged, not raised", a.heal("x", "y failed", force=True) is True)
+except OSError:
+    check("a Telegram outage during self-heal is logged, not raised", False)
+a.telegram = real_tg
+a.STATE = real_state
+sys.argv = ["test"]
 
 # --- watchdog -------------------------------------------------------------------------------------
 wd_state = TMP / "wd.json"

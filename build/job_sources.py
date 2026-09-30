@@ -162,7 +162,7 @@ def greenhouse(keep: re.Pattern, log=print) -> list[dict]:
             if exc.code == 404:
                 missing.append(slug)
             continue
-        except (urllib.error.URLError, TimeoutError):
+        except (OSError, ValueError):  # network, dropped connection or a non-JSON reply: skip this board only
             continue
         for job in data.get("jobs", []):
             loc = (job.get("location") or {}).get("name", "")

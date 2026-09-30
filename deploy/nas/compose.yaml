@@ -36,6 +36,8 @@ services:
       URGENT_SCORE: "85"               # alerts at or above this say "apply today"
       FOLLOWUP_DAYS: "7"               # nudge + draft follow-up after /applied with no update
       EXTRACT_MODEL: haiku             # reads alert emails; cheap is fine
+      STALL_MIN: "120"                 # no progress this long -> the process exits and Docker restarts it
+      HEAL: "1"                        # claude -p diagnoses repeated failures and applies safe fixes
       HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
     volumes:
       - ../..:/app                       # the code runs from the clone, so `git pull` + restart updates it

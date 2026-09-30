@@ -228,7 +228,7 @@ def collect() -> dict[str, dict]:
         for page in range(PAGES_PER_SEARCH):
             try:
                 data = fetch(search, page)
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (OSError, ValueError) as exc:  # URLError, timeouts, dropped connections, non-JSON replies
                 print(f"  ! {search} p{page}: {exc}", file=sys.stderr)
                 break
             results = data.get("results") or []

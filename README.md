@@ -113,6 +113,9 @@ Environment (put the secrets in `.env`, which is never committed):
 | `SEEN_DAYS` | `180` | Postings older than this are forgotten, keeping the state file small (tracked applications are kept) |
 | `FACTCHECK` | `1` | `0` skips the second pass that checks each draft's claims against the resume |
 | `BACKUP_DAYS` | `30` | Daily copies of the state file kept in `build/backups/` |
+| `STALL_MIN` | `120` | Minutes without loop progress before the process restarts itself |
+| `HEAL` | `1` | `0` turns off the `claude -p` self-repair step |
+| `HEAL_MAX_PER_DAY` | `6` | Cap on self-repair diagnoses per day |
 
 ### Telegram commands
 
@@ -127,6 +130,7 @@ Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_
 | `/pipeline` | Every tracked application and its status. |
 | `/selfcheck` | Tries every live dependency for real (private files loaded, Claude login, MyCareersFuture, one Greenhouse / Ashby / Lever board incl. a description fetch, the mailbox, storage and backups) and reports ✅ / ❌ / ⚪ with the reason. Also `python build/nas_agent.py --selfcheck`, which `update.sh` runs after every deploy. |
 | *a job link* | Sharing a link (LinkedIn / JobStreet app → Share → Telegram, or just pasting it) is the same as `/judge`. If the page needs a login, the bot says so and judges the description you paste next (within 2h). In a group, turn the bot's privacy mode off (BotFather → `/setprivacy` → Disable) so it can see plain messages; with privacy mode on it only sees commands and replies to its own messages. |
+| `/heal [what's wrong]` | Runs the self-repair step on the last recorded error (or on your description) and reports the diagnosis and what it did. |
 | `/sweep` | Runs a cycle now. |
 | `/help` | Lists the commands. |
 
@@ -136,6 +140,8 @@ Only one process may call `getUpdates` per bot token, so nothing else should pol
 
 Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually the Claude login expired or a usage limit was hit), you get a Telegram warning instead of silent retries.
 
+- **It doesn't die.** Every step of the main loop is guarded: an error is recorded and the loop carries on. A watchdog thread exits the process when the loop makes no progress for `STALL_MIN` (120) minutes, and Docker's `restart: unless-stopped` brings up a clean one. More than 5 starts in an hour backs off 10 minutes. An unreadable state file is swapped for the newest backup that parses (the broken copy is kept), and a failed save is logged instead of crashing. One garbled or dropped board reply skips only that board or search page.
+- **It repairs itself with `claude -p`, within limits.** When a sweep crashes, every judge call fails, the loop stalls or it crash-loops, `heal()` sends Claude the error, the recent sweeps, a `/selfcheck` and the code around the failure. Claude returns a diagnosis and picks remedies from a fixed list that the watcher carries out itself: wait and retry (1h back-off), restore the state from a backup, skip the queued Telegram messages, clear or skip postings that keep failing, pause the email reader for 24h, or restart the process. You get one Telegram message with the cause, what was done and anything you need to do. Claude never runs commands or edits code on the NAS: the container holds your tokens and reads untrusted text (job posts), so a proposed code fix is only saved to `build/patches/` for you to review. A Claude login failure skips the diagnosis and tells you how to renew the token. The same failure is diagnosed at most once per 6h, and at most `HEAL_MAX_PER_DAY` (6) times a day.
 - **Restarts don't re-sweep.** On start the loop waits until the next cycle is due, based on `last_cycle`, so a NAS reboot doesn't trigger a paid sweep. `/sweep` still forces one.
 - **Retries are bounded.** A posting whose verdict can't be parsed is given up after `MAX_ATTEMPTS` cycles. CLI, auth and network errors never count, so nothing is lost to an outage.
 - **Watchdog on the PC.** `build/watchdog.py` reads the Syncthing copy of the state file and messages Telegram once when the watcher goes quiet (heartbeat over `WATCHDOG_MAX_H`, default 2h), when it's alive but sweeps are stuck (no finished cycle in 2 × interval + 1h), or when the last cycle crashed. It sends one 🟢 message on recovery. Schedule `python build\watchdog.py` every 15 minutes in Task Scheduler; set `JOB_STATE` if the synced file isn't at `build/.nas_state.json`.
@@ -175,7 +181,7 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 10 files clean of control chars`.
-- `python build/test_nas_agent.py` runs 94 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, sharing links (login wall → pasted description), outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
+- `python build/test_nas_agent.py` runs 125 offline checks: staying alive (state recovery, failed saves, the stall watchdog, crash-loop back-off, a main loop that survives failing sweeps, one bad board reply), self-repair (each remedy, the login shortcut, rate limits, saved patches), the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, sharing links (login wall → pasted description), outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
 - GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations
