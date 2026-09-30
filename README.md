@@ -22,7 +22,7 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 - **The LLM can only pick from real data.** The verdict is enforced by `claude -p --json-schema`, and the schema's project list is an `enum` of the real project library, re-checked in code (`judge()` in `build/nas_agent.py`). The prompt also forbids inventing employers, numbers, certifications or years.
 - **Deterministic filters run before the LLM.** Regexes cut role shape, seniority, pay floor, excluded employers and public-sector/defence work before a single token is spent (`build/weekly_sweep.py`). The model only sees candidates that already pass. That keeps cost down and makes the hard rules auditable.
 - **Cost is capped and nothing gets lost.** `MAX_PER_CYCLE` (default 8) limits LLM calls per cycle. Postings over the cap, and any whose judge call fails, stay *unseen* and are retried next cycle rather than dropped. The first run only records a baseline, so turning it on doesn't flood you with every live posting.
-- **Coverage beyond scraping, without scraping.** LinkedIn, JobStreet, Glassdoor and Indeed stay login-walled to a crawler, but they all email you their alerts. With `IMAP_*` set, the watcher reads those emails read-only (`BODY.PEEK`, nothing marked read), has a cheap model (`EXTRACT_MODEL`, default `haiku`) list the postings in each, and runs them through the same regex filters and judge (`build/mail_alerts.py`).
+- **Coverage beyond scraping, without scraping.** LinkedIn, JobStreet, Glassdoor and Indeed stay login-walled to a crawler. Share a job from their app to the bot and it's judged like any other posting; when the page is login-walled, the bot asks you to paste the description and judges your next message against that link. Optionally, with `IMAP_*` set, the watcher also reads their alert emails read-only (`BODY.PEEK`, nothing marked read), has a cheap model (`EXTRACT_MODEL`, default `haiku`) list the postings in each, and runs them through the same regex filters and judge (`build/mail_alerts.py`).
 - **Built to get a reply, not just a draft.** Each fit comes with who to contact (likely hiring-manager titles plus a LinkedIn people-search link) and a ≤280-character connection note, also saved as `outreach.md`. Scores ≥ `URGENT_SCORE` are flagged "🔥 Apply today", and sweeps run every `BUSY_INTERVAL_HOURS` (2h) during weekday working hours so you see postings early.
 - **Outcomes close the loop.** Every fit gets a ref number. `/applied 12`, `/interview 12`, `/rejected 12`… record what happened; `FOLLOWUP_DAYS` after `/applied` with no update you get a nudge with a drafted follow-up email; `/interview` builds a prep pack; a Sunday digest reports reply rate by source and whether `FIT_THRESHOLD` looks miscalibrated.
 - **Every draft is fact-checked.** Before a fit is drafted, a second `claude -p` pass compares the tagline, summary, cover letter and outreach note with the resume and removes any claim it doesn't support (a wrong year, tool, certification or employer). The alert says how many claims it corrected and `fit.md` lists them; if the check itself fails, the alert says the draft is unchecked (`FACTCHECK=0` turns it off).
@@ -90,7 +90,7 @@ Environment (put the secrets in `.env`, which is never committed):
 | `FOLLOWUP_DAYS` | `7` | Days after `/applied` before a follow-up nudge |
 | `DIGEST_WEEKDAY` | `6` | Day for the weekly digest (Monday=0, Sunday=6), after 09:00 |
 | `EXTRACT_MODEL` | `haiku` | Model that lists the jobs in an alert email |
-| `IMAP_USER` / `IMAP_PASSWORD` | — | Mailbox holding your job alerts; for Gmail use an [app password](https://myaccount.google.com/apppasswords) |
+| `IMAP_USER` / `IMAP_PASSWORD` | — | Optional. Mailbox holding your job alerts; for Gmail use an [app password](https://myaccount.google.com/apppasswords) |
 | `IMAP_HOST` / `IMAP_FOLDER` | `imap.gmail.com` / `INBOX` | Where to look |
 | `MAIL_FROM` | LinkedIn, JobStreet, Glassdoor, Indeed senders | Comma-separated sender substrings to read |
 | `MAIL_DAYS` | `3` | How far back to look each sweep |
@@ -114,6 +114,7 @@ Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_
 | `/applied`, `/interview`, `/offer`, `/rejected`, `/ghosted` `<ref or text>` | Records an outcome for the alert with that ref, or for "Role at Company" you found elsewhere. `/interview` also replies with an interview prep pack (saved as `prep.md`). |
 | `/pipeline` | Every tracked application and its status. |
 | `/selfcheck` | Tries every live dependency for real (private files loaded, Claude login, MyCareersFuture, one Greenhouse / Ashby / Lever board incl. a description fetch, the mailbox, storage and backups) and reports ✅ / ❌ / ⚪ with the reason. Also `python build/nas_agent.py --selfcheck`, which `update.sh` runs after every deploy. |
+| *a job link* | Sharing a link (LinkedIn / JobStreet app → Share → Telegram, or just pasting it) is the same as `/judge`. If the page needs a login, the bot says so and judges the description you paste next (within 2h). In a group, turn the bot's privacy mode off (BotFather → `/setprivacy` → Disable) so it can see plain messages; with privacy mode on it only sees commands and replies to its own messages. |
 | `/sweep` | Runs a cycle now. |
 | `/help` | Lists the commands. |
 
@@ -162,7 +163,7 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 10 files clean of control chars`.
-- `python build/test_nas_agent.py` runs 88 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
+- `python build/test_nas_agent.py` runs 94 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, sharing links (login wall → pasted description), outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
 - GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations

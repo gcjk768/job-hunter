@@ -16,8 +16,10 @@ Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for comma
     /pipeline        every tracked application and its status
     /selfcheck       try every live dependency (Claude, boards, mail, storage) and report ✅/❌
     /help
+    <a job link>     sharing a link (e.g. from the LinkedIn or JobStreet app) is the same as /judge; if the
+                     page is login-walled the bot asks for the description and judges your next message
 
-It also reads job-alert emails (LinkedIn, JobStreet, Glassdoor, Indeed) from your inbox when IMAP_* is
+It can also read job-alert emails (LinkedIn, JobStreet, Glassdoor, Indeed) from your inbox when IMAP_* is
 set (mail_alerts.py), sweeps more often during working hours, drafts a LinkedIn outreach note for each
 fit, reminds you to follow up FOLLOWUP_DAYS after /applied, and posts a weekly digest.
 
@@ -807,6 +809,7 @@ HELP = ("Job watcher commands:\n"
         "/status — health, last cycle, recent runs\n"
         "/ask <question> — ask the model about seen jobs, drafts, or the system\n"
         "/judge <url> [pasted job text] — judge one posting now, draft if it fits\n"
+        "…or just share a job link here (LinkedIn/JobStreet app → Share → Telegram)\n"
         "/sweep — run a cycle now\n"
         "/applied, /interview, /offer, /rejected, /ghosted <ref or text> — record an outcome "
         "(/interview also builds a prep pack)\n"
@@ -893,6 +896,18 @@ def _page_text(url: str) -> tuple[str, str]:
     return (re.sub(r"\s+", " ", m.group(1)).strip() if m else ""), text
 
 
+LOGIN_WALL = re.compile(r"sign in to (view|see|apply)|join now|authwall|log ?in to (continue|view)|"
+                        r"verify you are (a )?human|captcha|enable javascript", re.I)
+URL = re.compile(r"https?://\S+")
+
+
+class Unreadable(ValueError):
+    """The page couldn't be read (login wall, bot block). Carries the URL so the bot can ask for the text."""
+    def __init__(self, url: str):
+        super().__init__("couldn't read the posting — paste the job description after the URL")
+        self.url = url
+
+
 def posting_from(arg: str) -> dict:
     """Turn '/judge <url> [pasted text]' into a record judge() understands."""
     url, _, pasted = arg.strip().partition(" ")
@@ -910,11 +925,19 @@ def posting_from(arg: str) -> dict:
                 "years": job.get("minimumYearsExperience"), "source": "MyCareersFuture",
                 "url": (job.get("metadata") or {}).get("jobDetailsUrl") or url}
     title = ""
+    url = mail_alerts.canonical_url(url) if url else url  # LinkedIn/JobStreet share links carry tracking
     if len(pasted) < 200 and url:
-        title, pasted = _page_text(url)
+        try:
+            title, pasted = _page_text(url)
+        except Exception:  # LinkedIn answers bots with 999/403: ask for the text instead
+            title, pasted = "", ""
+        if LOGIN_WALL.search(pasted) and len(pasted) < 3000:
+            title, pasted = "", ""
     if len(pasted) < 200:
-        raise ValueError("couldn't read enough of the posting — paste the job description after the URL")
-    return {"id": url or "pasted:" + hashlib.sha1(pasted.encode()).hexdigest()[:12], "title": title or pasted.split(".")[0][:80],
+        raise Unreadable(url)
+    key = mail_alerts.job_key("", "", url) if url else ""
+    return {"id": (key if key.startswith(("li:", "js:")) else url) or "pasted:" + hashlib.sha1(pasted.encode()).hexdigest()[:12],
+            "title": title or pasted.split(".")[0][:80],
             "company": "(see description)", "lo": None, "source": "link", "url": url, "desc": pasted[:6000]}
 
 
@@ -938,6 +961,44 @@ def judge_command(arg: str) -> str:
         return alert_text(rec, v, folder, ref)
     return (f"❌ {rec['title']} — {rec['company']}\nfit {v.get('score')}/100 (threshold {FIT_THRESHOLD}) · "
             f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\nGaps: {v.get('gaps')}")
+
+
+PENDING_H = 2  # how long the bot waits for a pasted description after asking for one
+
+
+def shared(text: str, thread) -> None:
+    """A plain message: job links are judged like /judge; a long text right after the bot asked for a
+    description is judged against the link it asked about. Anything else is ignored (it's a chat)."""
+    state = load_state()
+    pending = state.get("pending_judge") or {}
+    urls = list(dict.fromkeys(u.rstrip(").,>") for u in URL.findall(text)))[:3]
+    try:
+        if urls:
+            for url in urls:
+                telegram(f"⏳ Reading and judging {url}", thread)
+                try:
+                    telegram(judge_command(url), thread)
+                except Unreadable as exc:
+                    state = load_state()
+                    state["pending_judge"] = {"url": exc.url, "at": _now()}
+                    save_state(state)
+                    telegram("🔒 That page needs a login, so I can't read it. Paste the job description (title, "
+                             "company and the full text) as your next message and I'll judge it against this link.",
+                             thread)
+        elif pending and len(text) >= 200 and (_hours_since(pending.get("at")) or 99) < PENDING_H:
+            state.pop("pending_judge", None)
+            save_state(state)
+            telegram("⏳ Judging the pasted description…", thread)
+            telegram(judge_command(f"{pending['url']} {text}"), thread)
+    except Exception as exc:
+        telegram(f"⚠️ Couldn't judge that: {type(exc).__name__}: {exc}", thread)
+
+
+def _hours_since(stamp: str | None) -> float | None:
+    try:
+        return (dt.datetime.now() - dt.datetime.fromisoformat(stamp)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return None
 
 
 def poll_commands(state: dict, wait: int) -> bool:
@@ -966,7 +1027,10 @@ def poll_commands(state: dict, wait: int) -> bool:
         save_state(fresh)
         msg = u.get("message") or {}
         text = (msg.get("text") or "").strip()
-        if str(msg.get("chat", {}).get("id")) != str(chat) or not text.startswith("/"):
+        if str(msg.get("chat", {}).get("id")) != str(chat) or not text:
+            continue
+        if not text.startswith("/"):
+            shared(text, msg.get("message_thread_id"))
             continue
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0].lower()  # /ask@JobHunterBot in groups
@@ -1111,7 +1175,8 @@ def selfcheck() -> str:
           lambda d: d.get("jobs") or [], lambda d: d["jobs"][0].get("descriptionPlain") or "")
     board(f"Lever ({job_sources.LEVER[0]})", f"https://api.lever.co/v0/postings/{job_sources.LEVER[0]}?mode=json",
           lambda d: d if isinstance(d, list) else [], lambda d: d[0].get("descriptionPlain") or "")
-    run("Alert emails", mail_check)
+    if mail_alerts.configured():  # optional source; Telegram links cover LinkedIn/JobStreet otherwise
+        run("Alert emails", mail_check)
     run("Storage", storage_check)
     state = load_state()
     lines.append(f"ℹ️ Heartbeat {_age(state.get('heartbeat'))}, last sweep {_age(state.get('last_cycle'))}, "

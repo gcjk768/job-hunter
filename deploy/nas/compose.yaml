@@ -13,7 +13,7 @@
 #   CLAUDE_CODE_OAUTH_TOKEN=...   # from `claude setup-token` on your PC; bills your Claude subscription
 #                                 # (or ANTHROPIC_API_KEY=... to bill the API instead)
 #   TELEGRAM_BOT_TOKEN=...  TELEGRAM_CHAT_ID=...  TELEGRAM_THREAD_ID=...
-#   IMAP_USER=you@gmail.com  IMAP_PASSWORD=<Gmail app password>   # optional: read job-alert emails
+#   (optional) IMAP_USER=... IMAP_PASSWORD=...  # read job-alert emails; sharing links to the bot needs none
 services:
   job-hunter:
     build: .                           # deploy/nas/Dockerfile, copied next to this file

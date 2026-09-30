@@ -70,6 +70,8 @@ def fake_urlopen(req, data=None, timeout=0):
         return Resp(json.dumps({"jobs": [{"title": "SRE", "descriptionPlain": "Run infra"}]}).encode())
     if url.startswith("https://api.lever.co/v0/postings/"):
         return Resp(json.dumps([]).encode())
+    if url.startswith("https://www.linkedin.com/jobs/view/"):
+        return Resp(b"<html><title>LinkedIn</title><body>Sign in to view this job. Join now. " + b"x " * 300 + b"</body></html>")
     if url.startswith("https://example.com"):
         return Resp(b"<html><title>SRE at Example</title><body>" + b"Run Kubernetes. " * 30 + b"</body></html>")
     raise AssertionError(f"unexpected URL {url}")
@@ -407,6 +409,35 @@ a.alert_jobs = real_alert_jobs
 a.mail_alerts.fetch = lambda done: (_ for _ in ()).throw(OSError("imap down"))
 a.cycle()
 check("a mail failure doesn't stop the sweep", "imap down" in a.load_state()["runs"][-1]["note"])
+
+# --- sharing links in Telegram --------------------------------------------------------------------
+SENT.clear()
+UPDATES[:] = [msg(50, "Check out this job at Stark: https://www.linkedin.com/jobs/view/4011111111/?trackingId=Zx&refId=1"),
+              msg(51, "thanks!"), msg(52, "https://www.linkedin.com/jobs/view/4011111111/", chat=99)]
+a.poll_commands(a.load_state(), 1)
+st = a.load_state()
+check("a shared LinkedIn link behind a login asks for the description",
+      any("🔒 That page needs a login" in s for s in SENT)
+      and st.get("pending_judge", {}).get("url") == "https://www.linkedin.com/jobs/view/4011111111/")
+check("plain chat and other chats are ignored", len([s for s in SENT if "🔒" in s]) == 1 and not any("thanks" in s for s in SENT))
+SENT.clear()
+jd = "Senior SRE at Stark Industries, Singapore. " + "You will run our Kubernetes platform on AWS with Terraform. " * 6
+UPDATES[:] = [msg(53, jd)]
+a.poll_commands(a.load_state(), 1)
+st = a.load_state()
+check("the pasted description is judged against the shared link",
+      "li:4011111111" in st["seen"] and st["seen"]["li:4011111111"]["url"] == "https://www.linkedin.com/jobs/view/4011111111/"
+      and any("Apply today" in s for s in SENT) and "pending_judge" not in st)
+SENT.clear()
+UPDATES[:] = [msg(54, jd)]
+a.poll_commands(a.load_state(), 1)
+check("a long message with nothing pending is left alone", not SENT)
+UPDATES[:] = [msg(55, "have a look https://example.com/job/9 please")]
+a.poll_commands(a.load_state(), 1)
+check("a readable shared link is judged straight away", any("SRE at Example" in s for s in SENT))
+saved_user = os.environ.pop("IMAP_USER")
+check("the email check is hidden when email isn't set up", "Alert emails" not in a.selfcheck())
+os.environ["IMAP_USER"] = saved_user
 
 # --- /selfcheck -----------------------------------------------------------------------------------
 a.mail_alerts.fetch = lambda done: real_fetch(done, imap_factory=FakeIMAP)
