@@ -33,6 +33,18 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 - **The self-test checks behaviour, not syntax.** A `\b` written through a shell heredoc once collapsed into a literal backspace byte, and a filter silently matched nothing. `build/selftest.py` asserts 14 filter behaviours and scans the source for any C0 control character.
 - **Personal data stays out of git by default.** `.gitignore` is a *whitelist*: resume content (`content.py`), personal filters (`my_profile.py`), state, `.env` and generated documents are private unless someone deliberately publishes them. Example stand-ins (`*_example.py`) keep the repo runnable.
 
+## What it looks like in Telegram
+
+<table><tr>
+<td width="50%"><img src="docs/telegram-alert.png" alt="Sharing a LinkedIn job, pasting the description behind the login wall, the fit alert with outreach and fact-check, then /applied"></td>
+<td width="50%"><img src="docs/telegram-status.png" alt="/status, /selfcheck, a follow-up reminder with a drafted email, and the weekly digest"></td>
+</tr><tr>
+<td>Share a job → paste the description if it's login-walled → alert with fit, gaps, who to contact, fact-check and drafts → <code>/applied 12</code>.</td>
+<td><code>/status</code>, <code>/selfcheck</code>, the follow-up nudge 7 days after applying, and the Sunday digest.</td>
+</tr></table>
+
+<sub>Rendered from the bot's real message code with sample data.</sub>
+
 ## How it works
 
 Numbers match the diagram.
