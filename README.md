@@ -10,8 +10,6 @@ A job-search agent that runs 24/7 on my home NAS. It sweeps Singapore job boards
 
 ![Architecture](docs/architecture.drawio.svg)
 
-<sub>The diagram still shows the earlier Ollama backend; the judge now runs through `claude -p` (steps 4–5 below).</sub>
-
 <sub>Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) · PNG fallback: [`docs/architecture.png`](docs/architecture.png)</sub>
 
 ## Why this exists
