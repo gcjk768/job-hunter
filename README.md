@@ -113,6 +113,7 @@ Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_
 | `/judge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
 | `/applied`, `/interview`, `/offer`, `/rejected`, `/ghosted` `<ref or text>` | Records an outcome for the alert with that ref, or for "Role at Company" you found elsewhere. `/interview` also replies with an interview prep pack (saved as `prep.md`). |
 | `/pipeline` | Every tracked application and its status. |
+| `/selfcheck` | Tries every live dependency for real (private files loaded, Claude login, MyCareersFuture, one Greenhouse / Ashby / Lever board incl. a description fetch, the mailbox, storage and backups) and reports ✅ / ❌ / ⚪ with the reason. Also `python build/nas_agent.py --selfcheck`, which `update.sh` runs after every deploy. |
 | `/sweep` | Runs a cycle now. |
 | `/help` | Lists the commands. |
 
@@ -138,7 +139,7 @@ cd job-hunter
 sh deploy/nas/update.sh                               # first start, and every update after
 ```
 
-`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the repo root at `/app`, so the code runs straight from the clone. `update.sh` does `git pull --ff-only`, rebuilds the image only when the Dockerfile changed, and restarts the container; `/status` then shows the deployed commit. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude. The state file is copied to `build/backups/` once a day, and the last `BACKUP_DAYS` copies are kept; to restore, stop the container and copy one back over `build/.nas_state.json`.
+`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the repo root at `/app`, so the code runs straight from the clone. `update.sh` does `git pull --ff-only`, rebuilds the image only when the Dockerfile changed, restarts the container, then runs the self-check and prints the report; `/status` shows the deployed commit. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude. The state file is copied to `build/backups/` once a day, and the last `BACKUP_DAYS` copies are kept; to restore, stop the container and copy one back over `build/.nas_state.json`.
 
 ## Project structure
 
@@ -161,7 +162,7 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 10 files clean of control chars`.
-- `python build/test_nas_agent.py` runs 81 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, outcome tracking, follow-ups, the digest and backups, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
+- `python build/test_nas_agent.py` runs 88 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
 - GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations

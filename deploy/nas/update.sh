@@ -14,4 +14,5 @@ for f in .env build/content.py build/my_profile.py; do
 done
 docker compose -f deploy/nas/compose.yaml -p job-hunter up -d --build
 docker compose -f deploy/nas/compose.yaml -p job-hunter restart
-echo "job-hunter: $before -> $after. Send /status to the bot to confirm."
+echo "job-hunter: $before -> $after. Self-check:"
+docker exec job-hunter python build/nas_agent.py --selfcheck || echo "(fix the ❌ lines above, then run this again)"

@@ -60,8 +60,16 @@ def fake_urlopen(req, data=None, timeout=0):
         return Resp(json.dumps({"title": "Platform Engineer", "hiringCompany": {"name": "Acme"},
                                 "salary": {"minimum": 9000, "maximum": 12000}, "description": "<p>k8s</p>",
                                 "metadata": {"jobDetailsUrl": "https://mcf/job"}}).encode())
-    if url.startswith("https://boards-api.greenhouse.io/v1/boards/acme/jobs/77"):
+    if url.startswith("https://boards-api.greenhouse.io/v1/boards/") and url.endswith("/jobs/77"):
         return Resp(json.dumps({"content": "&lt;p&gt;Own our &lt;b&gt;EKS&lt;/b&gt; fleet&lt;/p&gt;"}).encode())
+    if url.startswith("https://boards-api.greenhouse.io/v1/boards/") and url.endswith("/jobs"):
+        return Resp(json.dumps({"jobs": [{"id": 77, "title": "SRE"}]}).encode())
+    if url.startswith("https://api.mycareersfuture.gov.sg/v2/jobs?"):
+        return Resp(json.dumps({"results": [{"uuid": "u1"}, {"uuid": "u2"}]}).encode())
+    if url.startswith("https://api.ashbyhq.com/posting-api/job-board/"):
+        return Resp(json.dumps({"jobs": [{"title": "SRE", "descriptionPlain": "Run infra"}]}).encode())
+    if url.startswith("https://api.lever.co/v0/postings/"):
+        return Resp(json.dumps([]).encode())
     if url.startswith("https://example.com"):
         return Resp(b"<html><title>SRE at Example</title><body>" + b"Run Kubernetes. " * 30 + b"</body></html>")
     raise AssertionError(f"unexpected URL {url}")
@@ -86,6 +94,8 @@ def fake_run(cmd, input=None, cwd=None, **kw):
         out["result"] = "Role X fits best."
     elif "interview prep pack" in input:
         out["result"] = "LIKELY QUESTIONS - design a multi-region EKS platform"
+    elif "single word OK" in input:
+        out["result"] = "OK"
     elif "follow-up email" in input:
         out["result"] = "Subject: Following up on the SRE role"
     else:
@@ -397,6 +407,35 @@ a.alert_jobs = real_alert_jobs
 a.mail_alerts.fetch = lambda done: (_ for _ in ()).throw(OSError("imap down"))
 a.cycle()
 check("a mail failure doesn't stop the sweep", "imap down" in a.load_state()["runs"][-1]["note"])
+
+# --- /selfcheck -----------------------------------------------------------------------------------
+a.mail_alerts.fetch = lambda done: real_fetch(done, imap_factory=FakeIMAP)
+SENT.clear()
+UPDATES[:] = [msg(40, "/selfcheck")]
+a.poll_commands(a.load_state(), 1)
+report = next((s for s in SENT if "🩺 Self-check" in s), "")
+check("/selfcheck reports Claude, MCF and each board",
+      "✅ Claude" in report and "✅ MyCareersFuture: 2 results" in report
+      and "✅ Greenhouse" in report and "description 17 chars" in report and "✅ Ashby" in report)
+check("/selfcheck marks an empty board as reachable, not failed", "⚪ Lever" in report and "no open roles" in report)
+check("/selfcheck logs in to the mailbox", "✅ Alert emails: logged in, 1 alert email(s)" in report)
+check("/selfcheck warns when the example resume/profile are loaded", "❌ Private files" in report
+      and "EXAMPLE resume" in report)
+check("/selfcheck checks storage and counts problems", "✅ Storage: writable" in report and "problem(s) above" in report)
+real_urlopen = a.urllib.request.urlopen
+a.urllib.request.urlopen = lambda req, *x, **k: fake_urlopen(req, *x, **k) if "telegram" in str(
+    getattr(req, "full_url", req)) else (_ for _ in ()).throw(OSError("network down"))
+report = a.selfcheck()
+a.urllib.request.urlopen = real_urlopen
+check("one failing dependency never hides the others",
+      report.count("❌") >= 5 and "✅ Claude" in report and "network down" in report)
+sys.argv = ["nas_agent.py", "--selfcheck"]
+try:
+    a.main()
+    check("--selfcheck exits non-zero on problems", False)
+except SystemExit as exc:
+    check("--selfcheck exits non-zero on problems", exc.code == 1)
+sys.argv = ["test"]
 os.environ.pop("IMAP_USER")
 
 # --- watchdog -------------------------------------------------------------------------------------

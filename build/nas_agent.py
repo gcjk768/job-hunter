@@ -2,6 +2,7 @@
 
     python build/nas_agent.py          # loop forever (the container's entrypoint)
     python build/nas_agent.py --once   # one cycle, then exit
+    python build/nas_agent.py --selfcheck   # check every live dependency, print the report, exit
 
 Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for commands:
     /status          health: last cycle, heartbeat, recent runs, errors (no LLM)
@@ -13,6 +14,7 @@ Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for comma
     /applied|/interview|/offer|/rejected|/ghosted <ref or free text>
                      record an outcome; /interview also writes an interview prep pack
     /pipeline        every tracked application and its status
+    /selfcheck       try every live dependency (Claude, boards, mail, storage) and report ✅/❌
     /help
 
 It also reads job-alert emails (LinkedIn, JobStreet, Glassdoor, Indeed) from your inbox when IMAP_* is
@@ -809,6 +811,7 @@ HELP = ("Job watcher commands:\n"
         "/applied, /interview, /offer, /rejected, /ghosted <ref or text> — record an outcome "
         "(/interview also builds a prep pack)\n"
         "/pipeline — tracked applications\n"
+        "/selfcheck — test Claude, the job boards, mail and storage for real\n"
         "Nothing here ever applies anywhere.")
 ASK_PROMPT = """You are the assistant inside James's self-hosted job watcher (a Docker container on his NAS).
 Answer his question briefly and concretely, in plain text (no markdown tables), from the context below.
@@ -992,6 +995,9 @@ def poll_commands(state: dict, wait: int) -> bool:
                     if OUTCOMES[cmd] == "interview":
                         telegram("⏳ Building the interview prep pack…", thread)
                         telegram(prep_pack(arg.strip()), thread)
+            elif cmd == "/selfcheck":
+                telegram("⏳ Running the self-check (about 30s)…", thread)
+                telegram(selfcheck(), thread)
             elif cmd == "/pipeline":
                 telegram(pipeline_text(load_state()) or "Nothing tracked yet.", thread)
             elif cmd == "/sweep":
@@ -1034,7 +1040,92 @@ def interval_now(now: dt.datetime | None = None) -> float:
     return BUSY_INTERVAL_H if busy else INTERVAL_H
 
 
+def selfcheck() -> str:
+    """Exercise every live dependency once and report. Each check is independent: one failure never
+    hides the others. Costs one tiny haiku call."""
+    lines = ["🩺 Self-check"]
+
+    def run(label: str, fn) -> None:
+        start = time.time()
+        try:
+            ok, detail = fn()
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {str(exc)[:160]}"
+        mark = {True: "✅", False: "❌", None: "⚪"}[ok]
+        lines.append(f"{mark} {label}: {detail} ({time.time() - start:.1f}s)")
+
+    def claude_check():
+        reply = claude("Reply with the single word OK and nothing else.", model=EXTRACT_MODEL)
+        return "OK" in reply.upper(), f"{claude_ok()}, {EXTRACT_MODEL} replied {reply[:20]!r}"
+
+    def mcf_check():
+        n = len(sweep.fetch("devops", 0).get("results") or [])
+        return n > 0, f"{n} results for 'devops'"
+
+    def board(name: str, url: str, count, with_desc=None):
+        def check():
+            data = job_sources._get(url)
+            jobs = count(data)
+            extra = ""
+            if with_desc and jobs:
+                extra = f", description {len(with_desc(data))} chars"
+            return len(jobs) > 0 or None, f"{len(jobs)} open roles{extra}" if jobs else "reachable, no open roles"
+        run(name, check)
+
+    def gh_desc(data):
+        first = data["jobs"][0]
+        slug = job_sources.GREENHOUSE[0]
+        full = job_sources._get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{first['id']}")
+        return job_sources._plain(full.get("content"))
+
+    def mail_check():
+        if not mail_alerts.configured():
+            return None, "not set up (IMAP_USER / IMAP_PASSWORD unset)"
+        mails = mail_alerts.fetch(set())
+        return True, f"logged in, {len(mails)} alert email(s) in the last {os.environ.get('MAIL_DAYS', '3')} days"
+
+    def storage_check():
+        probe = STATE.parent / ".selfcheck"
+        probe.write_text("ok")
+        probe.unlink()
+        backups = sorted((STATE.parent / "backups").glob("nas_state-*.json"))
+        size = STATE.stat().st_size // 1024 if STATE.exists() else 0
+        last = backups[-1].stem.split("-", 1)[1] if backups else "none yet"
+        return True, f"writable, state {size} KB, {len(backups)} backup(s), latest {last}"
+
+    def files_check():
+        missing = []
+        if "content" not in sys.modules:
+            missing.append("build/content.py (drafts use the EXAMPLE resume)")
+        if sweep.profile.__name__ != "my_profile":
+            missing.append("build/my_profile.py (EXAMPLE pay floor and exclusions)")
+        return (not missing), ("your resume and filters are loaded" if not missing else "missing " + "; ".join(missing))
+
+    run("Private files", files_check)
+    run("Claude", claude_check)
+    run("MyCareersFuture", mcf_check)
+    board(f"Greenhouse ({job_sources.GREENHOUSE[0]})",
+          f"https://boards-api.greenhouse.io/v1/boards/{job_sources.GREENHOUSE[0]}/jobs",
+          lambda d: d.get("jobs") or [], gh_desc)
+    board(f"Ashby ({job_sources.ASHBY[0]})", f"https://api.ashbyhq.com/posting-api/job-board/{job_sources.ASHBY[0]}",
+          lambda d: d.get("jobs") or [], lambda d: d["jobs"][0].get("descriptionPlain") or "")
+    board(f"Lever ({job_sources.LEVER[0]})", f"https://api.lever.co/v0/postings/{job_sources.LEVER[0]}?mode=json",
+          lambda d: d if isinstance(d, list) else [], lambda d: d[0].get("descriptionPlain") or "")
+    run("Alert emails", mail_check)
+    run("Storage", storage_check)
+    state = load_state()
+    lines.append(f"ℹ️ Heartbeat {_age(state.get('heartbeat'))}, last sweep {_age(state.get('last_cycle'))}, "
+                 f"code {code_version()}")
+    bad = sum(line.startswith("❌") for line in lines)
+    lines.append("All good." if not bad else f"{bad} problem(s) above.")
+    return "\n".join(lines)
+
+
 def main() -> None:
+    if "--selfcheck" in sys.argv:
+        report = selfcheck()
+        print(report)
+        sys.exit(1 if "❌" in report else 0)
     once = "--once" in sys.argv
     # A container restart (NAS reboot, image update, crash) must not trigger a full paid sweep each
     # time; resume the schedule from the last finished cycle instead. /sweep still forces one.
