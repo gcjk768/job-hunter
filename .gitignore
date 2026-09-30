@@ -19,6 +19,7 @@
 !/build/my_profile_example.py
 !/build/test_nas_agent.py
 !/build/watchdog.py
+!/build/mail_alerts.py
 
 /deploy/*
 !/deploy/nas/

@@ -10,6 +10,7 @@
 #   CLAUDE_CODE_OAUTH_TOKEN=...   # from `claude setup-token` on your PC; bills your Claude subscription
 #                                 # (or ANTHROPIC_API_KEY=... to bill the API instead)
 #   TELEGRAM_BOT_TOKEN=...  TELEGRAM_CHAT_ID=...  TELEGRAM_THREAD_ID=...
+#   IMAP_USER=you@gmail.com  IMAP_PASSWORD=<Gmail app password>   # optional: read job-alert emails
 services:
   job-hunter:
     build: .                           # deploy/nas/Dockerfile, copied next to this file
@@ -24,9 +25,14 @@ services:
       TZ: Asia/Singapore
       PYTHONUNBUFFERED: "1"
       JOB_MODEL: sonnet                # any `claude --model` value: haiku is cheaper, opus is stronger
-      SWEEP_INTERVAL_HOURS: "6"
+      SWEEP_INTERVAL_HOURS: "6"          # nights and weekends
+      BUSY_INTERVAL_HOURS: "2"           # Mon-Fri during BUSY_HOURS: apply early
+      BUSY_HOURS: "8-20"
       MAX_PER_CYCLE: "8"               # caps Claude usage per cycle
       FIT_THRESHOLD: "70"
+      URGENT_SCORE: "85"               # alerts at or above this say "apply today"
+      FOLLOWUP_DAYS: "7"               # nudge + draft follow-up after /applied with no update
+      EXTRACT_MODEL: haiku             # reads alert emails; cheap is fine
       HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
     volumes:
       - ./:/app

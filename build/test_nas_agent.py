@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import email.message
 import io
 import json
 import os
@@ -26,7 +27,13 @@ a.STATE, a.OUT = TMP / "state.json", TMP / "out"
 SENT: list[str] = []
 UPDATES: list[dict] = []
 VERDICT = {"suitable": True, "score": 85, "reason": "fits", "gaps": "none", "coding_test_risk": "low",
-           "tagline": "", "summary": "", "projects": [], "letter": ["p1", "p2"], "employer": "Acme"}
+           "tagline": "", "summary": "", "projects": [], "letter": ["p1", "p2"], "employer": "Acme",
+           "contact_titles": ["Head of Platform"], "outreach": "Hi, I run EKS platforms and saw your SRE role."}
+EXTRACTED = {"jobs": [
+    {"title": "Senior SRE", "company": "Globex", "location": "Singapore", "snippet": "EKS, Terraform",
+     "url": "https://www.linkedin.com/comm/jobs/view/4012345678/?trackingId=abc&refId=x"},
+    {"title": "Marketing Manager", "company": "Globex", "location": "Singapore", "snippet": "",
+     "url": "https://www.linkedin.com/comm/jobs/view/4099999999/"}]}
 
 
 class Resp(io.BytesIO):
@@ -66,15 +73,23 @@ def fake_run(cmd, input=None, cwd=None, **kw):
     assert cwd and not os.listdir(cwd), "must run in an empty directory"
     out = {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}
     if "--json-schema" in cmd:
-        out.update(result=json.dumps(VERDICT), structured_output=VERDICT)
+        got = EXTRACTED if '"jobs"' in cmd[cmd.index("--json-schema") + 1] else VERDICT
+        out.update(result=json.dumps(got), structured_output=got)
+    elif "which fits best?" in input:
+        out["result"] = "Role X fits best."
+    elif "interview prep pack" in input:
+        out["result"] = "LIKELY QUESTIONS - design a multi-region EKS platform"
+    elif "follow-up email" in input:
+        out["result"] = "Subject: Following up on the SRE role"
     else:
-        out["result"] = "Role X fits best." if "which fits best?" in input else "?"
+        out["result"] = "?"
     return subprocess.CompletedProcess(cmd, 0, json.dumps(out), "")
 
 
 a.urllib.request.urlopen = fake_urlopen
 a.subprocess.run = fake_run
-a.build = lambda rec, v: TMP / "draft"  # document rendering has its own checks
+real_build = a.build
+a.build = lambda rec, v: TMP / "draft"  # document rendering is checked once, below
 CHECKS: list[tuple[str, bool]] = []
 
 
@@ -174,6 +189,163 @@ try:
     check("/judge with short pasted text falls back to the page", True)
 except ValueError:
     check("/judge with short pasted text falls back to the page", False)
+
+# --- alerts: urgency, outreach, refs --------------------------------------------------------------
+SENT.clear()
+a.candidates = lambda: [rec("j10")]
+a.cycle()
+alert = next((s for s in SENT if "SRE j10" in s), "")
+check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 Apply today" in alert)
+check("alert carries who to reach, a people-search link and the note",
+      "Reach out to: Head of Platform" in alert and "linkedin.com/search/results/people" in alert
+      and "I run EKS platforms" in alert)
+ref10 = a.load_state()["seen"]["j10"]["ref"]
+check("fits get a ref number in the alert", f"/applied {ref10}" in alert)
+
+folder = real_build(rec("j10") | {"url": "https://x/job"},
+                    dict(VERDICT, projects=a.PROJECTS[:3], tagline="t", summary="s"))
+check("the draft folder gets outreach.md", "Head of Platform" in (folder / "outreach.md").read_text())
+
+# --- outcome tracking -----------------------------------------------------------------------------
+SENT.clear()
+UPDATES[:] = [msg(20, f"/applied {ref10}"), msg(21, "/applied Staff SRE at Initech"), msg(22, "/pipeline"),
+              msg(23, f"/interview #{ref10}")]
+a.poll_commands(a.load_state(), 1)
+st = a.load_state()
+e10 = st["seen"]["j10"]
+check("/applied records status and date", e10["status"] == "interview" and e10.get("applied_at"))
+check("/applied with free text tracks a manual entry",
+      any(e.get("source") == "manual" and e["c"] == "Initech" for e in st["seen"].values()))
+check("/pipeline lists tracked applications", any("Initech" in s and f"#{ref10}" in s for s in SENT))
+check("/interview replies with a prep pack", any("📚 LIKELY QUESTIONS" in s for s in SENT))
+check("history keeps every status change", [h[0] for h in e10["history"]] == ["drafted", "applied", "interview"])
+
+st["seen"]["old-tracked"] = {"t": "x", "c": "y", "at": "2000-01-01T00:00:00", "ref": 999}
+a.prune(st)
+check("prune keeps tracked applications", "old-tracked" in st["seen"])
+
+# --- follow-ups and the weekly digest -------------------------------------------------------------
+monday10 = dt.datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+monday10 -= dt.timedelta(days=monday10.weekday())
+st = a.load_state()
+man = next(k for k, e in st["seen"].items() if e.get("source") == "manual")
+st["seen"][man]["applied_at"] = (monday10 - dt.timedelta(days=a.FOLLOWUP_DAYS + 1)).isoformat()
+a.save_state(st)
+SENT.clear()
+a.chores(monday10)
+a.chores(monday10)
+check("a stale application gets exactly one follow-up nudge with a draft",
+      sum("⏰" in s for s in SENT) == 1 and any("Following up on the SRE role" in s for s in SENT))
+SENT.clear()
+sunday10 = monday10 + dt.timedelta(days=6)
+a.chores(sunday10)
+a.chores(sunday10)
+check("the weekly digest is sent once per week", sum("Weekly job-hunt digest" in s for s in SENT) == 1)
+check("the digest reports the reply rate", any("reply rate" in s for s in SENT))
+SENT.clear()
+a.chores(sunday10 + dt.timedelta(days=1, hours=-3))
+check("no chores before 09:00", not SENT)
+st = a.load_state()
+st["seen"][man].pop("followup_sent")
+st.pop("followups_checked")
+a.save_state(st)
+real_run = a.subprocess.run
+a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "Invalid API key")
+SENT.clear()
+CALLS.clear()
+for _ in range(3):
+    a.chores(monday10)
+a.subprocess.run = real_run
+check("a failing follow-up draft still nudges, once, without retrying every loop",
+      sum("⏰" in s for s in SENT) == 1 and any("couldn't draft one" in s for s in SENT))
+
+# --- sweep cadence --------------------------------------------------------------------------------
+check("weekday working hours use the busy interval", a.interval_now(monday10) == a.BUSY_INTERVAL_H)
+check("evenings use the normal interval", a.interval_now(monday10.replace(hour=22)) == a.INTERVAL_H)
+check("weekends use the normal interval", a.interval_now(sunday10) == a.INTERVAL_H)
+
+# --- job-alert emails -----------------------------------------------------------------------------
+import mail_alerts  # noqa: E402
+
+check("html_to_text keeps each link's URL",
+      "Senior SRE [https://x/1]" in mail_alerts.html_to_text('<p><a href="https://x/1"><b>Senior SRE</b></a></p>'))
+check("LinkedIn tracking links are canonicalised",
+      mail_alerts.canonical_url("https://www.linkedin.com/comm/jobs/view/4012345678/?trackingId=abc")
+      == "https://www.linkedin.com/jobs/view/4012345678/")
+check("board job ids become stable keys",
+      mail_alerts.job_key("x", "y", "https://www.linkedin.com/jobs/view/4012345678/") == "li:4012345678")
+check("without an id the key is title+company, case-insensitive",
+      mail_alerts.job_key("Senior SRE", "Globex", "https://g/1") == mail_alerts.job_key("senior sre", "GLOBEX", "https://g/2"))
+
+
+def raw_mail(mid: str, sender: str, subject: str, body: str) -> bytes:
+    m = email.message.EmailMessage()
+    m["Message-ID"], m["From"], m["Subject"] = mid, sender, subject
+    m.set_content(body, subtype="html")
+    return m.as_bytes()
+
+
+class FakeIMAP:
+    boxes = {b"1": raw_mail("<a1@li>", "LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>",
+                            "10 new jobs for platform engineer", '<a href="https://li/1">Senior SRE</a>'),
+             b"2": raw_mail("<n1@li>", "LinkedIn <jobalerts-noreply@linkedin.com>",
+                            "Your weekly profile views", "<p>not a job</p>")}
+    readonly = None
+
+    def login(self, user, pw):
+        pass
+
+    def select(self, folder, readonly=False):
+        FakeIMAP.readonly = readonly
+
+    def search(self, charset, *crit):
+        return "OK", [b"1 2" if "linkedin" in crit[-1] else b""]
+
+    def fetch(self, num, what):
+        assert "PEEK" in what, "must not mark mail as read"
+        return "OK", [(b"", self.boxes[num])]
+
+    def logout(self):
+        pass
+
+
+os.environ.update(IMAP_USER="me@gmail.com", IMAP_PASSWORD="app-pw")
+mails = mail_alerts.fetch(set(), imap_factory=FakeIMAP)
+check("only alert-looking emails are read, read-only", [m["id"] for m in mails] == ["<a1@li>"] and FakeIMAP.readonly)
+check("already-processed emails are skipped", mail_alerts.fetch({"<a1@li>"}, imap_factory=FakeIMAP) == [])
+
+real_fetch = mail_alerts.fetch
+a.mail_alerts.fetch = lambda done: real_fetch(done, imap_factory=FakeIMAP)
+CALLS.clear()
+SENT.clear()
+a.candidates = lambda: []
+a.cycle()
+st = a.load_state()
+check("alert emails are read with the cheap extract model",
+      any("--model" in c and c[c.index("--model") + 1] == a.EXTRACT_MODEL for c in CALLS))
+check("jobs from alert emails are judged and alerted",
+      "li:4012345678" in st["seen"] and any("via email:linkedin" in s for s in SENT))
+check("the regex filters apply to email jobs too", "li:4099999999" not in st["seen"])
+check("processed emails are remembered", "<a1@li>" in st["mail_done"])
+SENT.clear()
+a.cycle()
+check("the same alert is not judged twice", not any("Senior SRE" in s for s in SENT))
+two = [{"id": "<ok@li>", "from": "jobalerts-noreply@linkedin.com", "subject": "jobs", "text": "a"},
+       {"id": "<bad@li>", "from": "jobalerts-noreply@linkedin.com", "subject": "jobs", "text": "b"}]
+real_alert_jobs = a.alert_jobs
+a.alert_jobs = lambda m: (_ for _ in ()).throw(a.ClaudeError("limit")) if m["id"] == "<bad@li>" else \
+    [dict(rec("mail-ok"), source="email:linkedin")]
+a.mail_alerts.fetch = lambda done: [m for m in two if m["id"] not in done]
+a.cycle()
+st = a.load_state()
+check("one bad alert email doesn't lose the jobs from the others",
+      "mail-ok" in st["seen"] and "<ok@li>" in st["mail_done"] and "<bad@li>" not in st["mail_done"])
+check("the unread email is reported in the run note", "1 alert email(s) not read" in st["runs"][-1]["note"])
+a.alert_jobs = real_alert_jobs
+a.mail_alerts.fetch = lambda done: (_ for _ in ()).throw(OSError("imap down"))
+a.cycle()
+check("a mail failure doesn't stop the sweep", "imap down" in a.load_state()["runs"][-1]["note"])
+os.environ.pop("IMAP_USER")
 
 # --- watchdog -------------------------------------------------------------------------------------
 wd_state = TMP / "wd.json"
