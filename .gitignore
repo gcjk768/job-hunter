@@ -7,6 +7,7 @@
 !/build/
 !/deploy/
 !/docs/
+!/.github/
 
 /build/*
 !/build/nas_agent.py
@@ -16,11 +17,14 @@
 !/build/selftest.py
 !/build/content_example.py
 !/build/my_profile_example.py
+!/build/test_nas_agent.py
+!/build/watchdog.py
 
 /deploy/*
 !/deploy/nas/
 /deploy/nas/*
 !/deploy/nas/compose.yaml
+!/deploy/nas/Dockerfile
 
 /docs/*
 !/docs/architecture.drawio

@@ -1,0 +1,19 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install python-docx
+      - name: Filter behaviour + control-character scan
+        run: python build/selftest.py
+      - name: NAS loop, Telegram commands, watchdog (offline)
+        run: python build/test_nas_agent.py

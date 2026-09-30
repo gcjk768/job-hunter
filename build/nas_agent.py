@@ -6,6 +6,9 @@
 Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for commands:
     /status          health: last cycle, heartbeat, recent runs, errors (no LLM)
     /ask <question>  ask the model about the jobs it has seen, the drafts, or the system
+    /judge <url> [pasted job text]
+                     judge one posting on demand (MCF links are read via the API; for login-walled
+                     boards like LinkedIn paste the description after the URL) and draft if it fits
     /sweep           run a cycle now
     /help
 
@@ -25,6 +28,7 @@ Env: OLLAMA_BASE_URL, JOB_MODEL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -51,6 +55,11 @@ INTERVAL_H = float(os.environ.get("SWEEP_INTERVAL_HOURS", "6"))
 MAX_PER_CYCLE = int(os.environ.get("MAX_PER_CYCLE", "8"))
 FIT_THRESHOLD = int(os.environ.get("FIT_THRESHOLD", "70"))
 HEARTBEAT_MIN = float(os.environ.get("HEARTBEAT_MIN", "30"))
+# A posting whose verdict keeps failing to parse is given up after this many cycles instead of
+# eating a MAX_PER_CYCLE slot forever. Network errors (Ollama down) never count against it.
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+PERMANENT = (ValueError, KeyError, TypeError)  # json.JSONDecodeError is a ValueError
+SEEN_DAYS = int(os.environ.get("SEEN_DAYS", "180"))  # forget postings older than this
 MASTER = build_docs.MASTER
 PROJECTS = [p["name"] for p in MASTER["projects"]]
 
@@ -82,6 +91,7 @@ Return ONLY a JSON object:
   "tagline": "resume tagline for this role, pipe-separated like the candidate's",
   "summary": "tailored professional summary, 90-130 words, first person implied, only true claims from the resume",
   "projects": [3-4 project names chosen ONLY from {projects}, most relevant first],
+  "employer": "the hiring company's name as the job text states it, else empty",
   "letter": ["4-6 cover-letter paragraphs: why this role, matching evidence against the posting's stated requirements, the honest gaps, close. No greeting or sign-off."]}}
 If suitable is false, leave tagline, summary, letter empty and projects [].
 Never invent employers, numbers, certifications or years that are not in the resume."""
@@ -121,7 +131,8 @@ def judge(rec: dict) -> dict:
     pay = "not published" if rec.get("lo") is None else f"${rec['lo']:,}-{rec.get('hi') or ''}"
     prompt = PROMPT.format(today=dt.date.today(), floor=sweep.SALARY_FLOOR,
                            excluded=sweep.profile.EXCLUDED_EMPLOYERS_TEXT, profile=profile(), title=rec["title"], company=rec["company"], pay=pay,
-                           years=rec.get("years") or "n/s", desc=description(rec), projects=PROJECTS)
+                           years=rec.get("years") or "n/s", desc=rec.get("desc") or description(rec),
+                           projects=PROJECTS)
     # think=False: on reasoning models the thinking otherwise eats the reply and content comes back empty.
     resp = _post(f"{OLLAMA}/api/chat", {"model": MODEL, "stream": False, "format": "json", "think": False,
                                         "messages": [{"role": "user", "content": prompt}]})
@@ -149,6 +160,19 @@ def build(rec: dict, v: dict) -> Path:
         f"Score {v.get('score')} · coding-test risk {v.get('coding_test_risk')}\n\n"
         f"Why: {v.get('reason')}\n\nGaps: {v.get('gaps')}\n", encoding="utf-8")
     return outdir
+
+
+def is_fit(v: dict) -> bool:
+    return bool(v.get("suitable")) and int(v.get("score") or 0) >= FIT_THRESHOLD and bool(v.get("letter"))
+
+
+def alert_text(r: dict, v: dict, folder: Path) -> str:
+    pay = "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
+    return (f"🆕 {r['title']} — {r['company'].title()}\n{pay} · fit {v['score']}/100 · "
+            f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\n"
+            f"Gaps: {v.get('gaps')}\n\n{r.get('url', '')}\n\n"
+            f"Resume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
+            f"Nothing was submitted — your call.")
 
 
 def telegram(text: str, thread: str | int | None = None) -> None:
@@ -191,6 +215,7 @@ def candidates() -> list[dict]:
 def cycle() -> None:
     state = load_state()
     seen = state["seen"]
+    prune(state)
     state["last_cycle_start"] = _now()
     save_state(state)
     jobs = candidates()
@@ -198,7 +223,7 @@ def cycle() -> None:
     if not seen:
         # First run: everything on the boards today is old news (the PC sweep already covered it).
         for r in jobs:
-            seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": None}
+            seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": None, "at": _now()}
         _finish(state, {"candidates": len(jobs), "new": len(jobs), "judged": 0, "fits": 0, "failed": 0,
                         "note": "baseline"})
         telegram(f"Job watcher online on the NAS. Baseline: {len(jobs)} current postings; "
@@ -209,6 +234,7 @@ def cycle() -> None:
     print(f"[{dt.datetime.now():%F %T}] {len(jobs)} candidates, {len(new)} new")
     judged = fits = failed = 0
     last_fail = ""
+    attempts = state.setdefault("attempts", {})
     for r in new[:MAX_PER_CYCLE]:
         try:
             v = judge(r)
@@ -216,21 +242,25 @@ def cycle() -> None:
             failed += 1
             last_fail = f"{type(exc).__name__}: {exc}"
             print(f"  ! judge failed for {r['title']} @ {r['company']}: {exc}")
+            if isinstance(exc, PERMANENT):  # the model's reply, not the network: count it
+                key = ident(r)
+                attempts[key] = attempts.get(key, 0) + 1
+                if attempts[key] >= MAX_ATTEMPTS:
+                    seen[key] = {"t": r["title"], "c": r["company"], "fit": None, "at": _now(),
+                                 "gave_up": last_fail[:200]}
+                    del attempts[key]
+                    print(f"  ! gave up on {r['title']} @ {r['company']} after {MAX_ATTEMPTS} tries")
+                save_state(state)
             continue
         judged += 1
-        fit = bool(v.get("suitable")) and int(v.get("score") or 0) >= FIT_THRESHOLD and v.get("letter")
+        attempts.pop(ident(r), None)
+        fit = is_fit(v)
         seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": v.get("score"), "suitable": bool(fit),
                           "why": v.get("reason"), "url": r.get("url", ""), "at": _now()}
         print(f"  {v.get('score'):>3} {'FIT ' if fit else 'skip'} {r['title']} @ {r['company']}")
         if fit:
             fits += 1
-            folder = build(r, v)
-            pay = "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
-            telegram(f"🆕 {r['title']} — {r['company'].title()}\n{pay} · fit {v['score']}/100 · "
-                     f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\n"
-                     f"Gaps: {v.get('gaps')}\n\n{r.get('url', '')}\n\n"
-                     f"Resume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
-                     f"Nothing was submitted — your call.")
+            telegram(alert_text(r, v, build(r, v)))
         save_state(state)
     _finish(state, {"candidates": len(jobs), "new": len(new), "judged": judged, "fits": fits,
                     "failed": failed, "note": last_fail[:300]})
@@ -239,6 +269,18 @@ def cycle() -> None:
         # silently retrying forever.
         telegram(f"⚠️ Job watcher: all {failed} judge calls failed ({last_fail[:200]}). "
                  f"Is trading-ollama running? Postings stay unseen and retry next cycle.")
+
+
+def prune(state: dict) -> None:
+    """Forget postings older than SEEN_DAYS so the state file (synced every heartbeat) stays small.
+    Entries from before timestamps existed are stamped now and age out from here. A posting still
+    live after SEEN_DAYS just gets judged once more."""
+    cutoff = (dt.datetime.now() - dt.timedelta(days=SEEN_DAYS)).isoformat(timespec="seconds")
+    seen = state["seen"]
+    for key, v in list(seen.items()):
+        v.setdefault("at", _now())
+        if v["at"] < cutoff:
+            del seen[key]
 
 
 def _finish(state: dict, run: dict) -> None:
@@ -264,6 +306,7 @@ def record_error(text: str) -> None:
 HELP = ("Job watcher commands:\n"
         "/status — health, last cycle, recent runs\n"
         "/ask <question> — ask the model about seen jobs, drafts, or the system\n"
+        "/judge <url> [pasted job text] — judge one posting now, draft if it fits\n"
         "/sweep — run a cycle now\n"
         "Nothing here ever applies anywhere.")
 ASK_PROMPT = """You are the assistant inside James's self-hosted job watcher (a Docker container on his NAS).
@@ -336,6 +379,62 @@ def ask(question: str) -> str:
     return (resp.get("message", {}).get("content") or "").strip() or "(the model returned nothing)"
 
 
+MCF_UUID = re.compile(r"([0-9a-f]{32})")
+
+
+def _page_text(url: str) -> tuple[str, str]:
+    """(title, visible text) of a plain web page. Login-walled boards return little; paste instead."""
+    req = urllib.request.Request(url, headers=sweep.UA)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read(2_000_000).decode("utf-8", "replace")
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    body = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body)).strip()
+    return (re.sub(r"\s+", " ", m.group(1)).strip() if m else ""), text
+
+
+def posting_from(arg: str) -> dict:
+    """Turn '/judge <url> [pasted text]' into a record judge() understands."""
+    url, _, pasted = arg.strip().partition(" ")
+    if not url.startswith("http"):
+        url, pasted = "", arg.strip()
+    pasted = pasted.strip()
+    m = MCF_UUID.search(url) if "mycareersfuture" in url else None
+    if m:
+        req = urllib.request.Request(f"{sweep.API}/{m.group(1)}", headers=sweep.UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            job = json.load(r)
+        lo, hi = sweep.monthly_salary(job)
+        return {"uuid": m.group(1), "id": m.group(1), "title": (job.get("title") or "").strip(),
+                "company": sweep.company_of(job), "lo": lo, "hi": hi,
+                "years": job.get("minimumYearsExperience"), "source": "MyCareersFuture",
+                "url": (job.get("metadata") or {}).get("jobDetailsUrl") or url}
+    title = ""
+    if len(pasted) < 200 and url:
+        title, pasted = _page_text(url)
+    if len(pasted) < 200:
+        raise ValueError("couldn't read enough of the posting — paste the job description after the URL")
+    return {"id": url or "pasted:" + hashlib.sha1(pasted.encode()).hexdigest()[:12], "title": title or pasted.split(".")[0][:80],
+            "company": "(see description)", "lo": None, "source": "link", "url": url, "desc": pasted[:6000]}
+
+
+def judge_command(arg: str) -> str:
+    rec = posting_from(arg)
+    v = judge(rec)
+    if rec["company"] == "(see description)" and v.get("employer"):
+        rec["company"] = v["employer"]
+    fit = is_fit(v)
+    state = load_state()
+    state["seen"][rec.get("uuid") or rec["id"]] = {"t": rec["title"], "c": rec["company"], "fit": v.get("score"),
+                                                   "suitable": fit, "why": v.get("reason"),
+                                                   "url": rec.get("url", ""), "at": _now(), "via": "judge"}
+    save_state(state)
+    if fit:
+        return alert_text(rec, v, build(rec, v))
+    return (f"❌ {rec['title']} — {rec['company']}\nfit {v.get('score')}/100 (threshold {FIT_THRESHOLD}) · "
+            f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\nGaps: {v.get('gaps')}")
+
+
 def poll_commands(state: dict, wait: int) -> bool:
     """Long-poll Telegram for up to `wait` seconds and handle commands. Returns True when /sweep asked for
     a cycle now. Only messages from TELEGRAM_CHAT_ID are answered; everyone else is ignored."""
@@ -355,8 +454,11 @@ def poll_commands(state: dict, wait: int) -> bool:
         return False
     sweep_now = False
     for u in updates:
-        state["tg_offset"] = u["update_id"] + 1
-        save_state(state)  # persist first, so a crash on one message never replays it forever
+        # Persist first, so a crash on one message never replays it forever. Re-read rather than reuse
+        # `state`: a previous command (/judge) may have written the file since.
+        fresh = load_state()
+        fresh["tg_offset"] = u["update_id"] + 1
+        save_state(fresh)
         msg = u.get("message") or {}
         text = (msg.get("text") or "").strip()
         if str(msg.get("chat", {}).get("id")) != str(chat) or not text.startswith("/"):
@@ -374,6 +476,12 @@ def poll_commands(state: dict, wait: int) -> bool:
                     telegram("Usage: /ask <question>, e.g. /ask which of this week's roles fit best?", thread)
                 else:
                     telegram("🤔 " + ask(arg.strip()), thread)
+            elif cmd == "/judge":
+                if not arg.strip():
+                    telegram("Usage: /judge <url> [pasted job description]", thread)
+                else:
+                    telegram("⏳ Reading and judging…", thread)
+                    telegram(judge_command(arg), thread)
             elif cmd == "/sweep":
                 telegram("Running a sweep now…", thread)
                 sweep_now = True
@@ -395,8 +503,23 @@ def idle(seconds: float) -> None:
             return
 
 
+def due_in(state: dict) -> float:
+    """Seconds until the next cycle is due, from the last finished one (0 if overdue or never ran)."""
+    try:
+        last = dt.datetime.fromisoformat(state["last_cycle"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, INTERVAL_H * 3600 - (dt.datetime.now() - last).total_seconds())
+
+
 def main() -> None:
     once = "--once" in sys.argv
+    # A container restart (NAS reboot, image update, crash) must not trigger a full paid sweep each
+    # time; resume the schedule from the last finished cycle instead. /sweep still forces one.
+    wait = 0.0 if once else due_in(load_state())
+    if wait:
+        print(f"[{dt.datetime.now():%F %T}] last cycle is recent; next one in {wait / 3600:.1f}h")
+        idle(wait)
     while True:
         try:
             cycle()

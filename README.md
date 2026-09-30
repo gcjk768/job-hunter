@@ -76,6 +76,8 @@ Environment (put the secrets in `.env`, which is never committed):
 | `MAX_PER_CYCLE` | `8` | Max LLM judgements per cycle |
 | `FIT_THRESHOLD` | `70` | Minimum score before drafting and alerting |
 | `HEARTBEAT_MIN` | `30` | How often the idle loop rewrites the heartbeat in the state file |
+| `MAX_ATTEMPTS` | `3` | Cycles a posting may fail with unparseable model output before it's given up |
+| `SEEN_DAYS` | `180` | Postings older than this are forgotten, keeping the state file small |
 
 ### Telegram commands
 
@@ -85,6 +87,7 @@ Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_
 |---|---|
 | `/status` | Heartbeat, last cycle, Ollama reachability, last 5 runs, last error. No LLM call. |
 | `/ask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
+| `/judge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
 | `/sweep` | Runs a cycle now. |
 | `/help` | Lists the commands. |
 
@@ -94,9 +97,13 @@ Only one process may call `getUpdates` per bot token, so nothing else should pol
 
 Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually because `trading-ollama` is down), you get a Telegram warning instead of silent retries.
 
+- **Restarts don't re-sweep.** On start the loop waits until the next cycle is due, based on `last_cycle`, so a NAS reboot doesn't trigger a paid sweep. `/sweep` still forces one.
+- **Retries are bounded.** A posting whose verdict can't be parsed is given up after `MAX_ATTEMPTS` cycles. Network errors (Ollama down) never count, so nothing is lost to an outage.
+- **Watchdog on the PC.** `build/watchdog.py` reads the Syncthing copy of the state file and messages Telegram once when the watcher goes quiet (heartbeat over `WATCHDOG_MAX_H`, default 2h), when it's alive but sweeps are stuck (no finished cycle in 2 × interval + 1h), or when the last cycle crashed. It sends one 🟢 message on recovery. Schedule `python build\watchdog.py` every 15 minutes in Task Scheduler; set `JOB_STATE` if the synced file isn't at `build/.nas_state.json`.
+
 ### On a NAS (Docker)
 
-`deploy/nas/compose.yaml` runs the agent on `python:3.12-slim` with the project folder mounted. Put `compose.yaml`, `.env` and `build/` in the share and create the project. It expects an existing Ollama container on an external Docker network, so change `networks.desk.name` and `OLLAMA_BASE_URL` to match your setup.
+`deploy/nas/compose.yaml` builds a small image from `deploy/nas/Dockerfile` (`python:3.12-slim` + `python-docx`, installed once at build time) and mounts the project folder. Put `compose.yaml`, `Dockerfile`, `.env` and `build/` in the share and create the project. After a code-only change, copy `build/*.py` and restart; rebuild only when the Dockerfile changes. It expects an existing Ollama container on an external Docker network, so change `networks.desk.name` and `OLLAMA_BASE_URL` to match your setup.
 
 ## Project structure
 
@@ -107,15 +114,19 @@ build/
   job_sources.py        # Greenhouse / Ashby / Lever / amazon.jobs / Workday / NVIDIA / Apple
   build_docs.py         # ATS-plain resume + cover letter (.docx)
   selftest.py           # behaviour checks + control-character scan
+  test_nas_agent.py     # offline tests: cycles, retries, Telegram commands, watchdog
+  watchdog.py           # PC-side: alerts when the NAS stops reporting
   *_example.py          # public stand-ins for the gitignored personal files
-deploy/nas/compose.yaml # NAS deployment
+deploy/nas/            # compose.yaml + Dockerfile for the NAS
+.github/workflows/      # CI: both test scripts on every push
 docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ```
 
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 7 files clean of control chars`.
-- There's no unit-test suite or CI yet. The self-test is the gate before trusting a sweep.
+- `python build/test_nas_agent.py` runs offline checks of the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling), every Telegram command and the watchdog, with Telegram, Ollama and MyCareersFuture faked.
+- GitHub Actions runs both on every push (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations
 
@@ -124,7 +135,7 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 - **JSON-file state, single instance.** That's fine for one container on one NAS. Running more than one would need a real store with locking.
 - **The regex filters are Singapore- and profile-specific.** They're tuned for one person's search, not written as a general-purpose product.
 - **Workday tenants can't be guessed.** Only tenants with verified site IDs are included. The others returned 404/422.
-- Roadmap ideas: pull JDs from ATS APIs where available, add a unit-test suite and CI, and track the outcome of each application to calibrate the threshold.
+- Roadmap ideas: pull JDs from ATS APIs where available, and track the outcome of each application to calibrate the threshold.
 
 ---
 
