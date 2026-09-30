@@ -332,9 +332,19 @@ def is_fit(v: dict) -> bool:
     return bool(v.get("suitable")) and int(v.get("score") or 0) >= FIT_THRESHOLD and bool(v.get("letter"))
 
 
+def pay_text(r: dict) -> str:
+    if r.get("lo") is None:
+        return "pay not published"
+    return f"${r['lo']:,}–{r['hi']:,}/mo" if r.get("hi") else f"from ${r['lo']:,}/mo"
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
 def alert_text(r: dict, v: dict, folder: Path, ref: int | None = None) -> str:
-    pay = "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
-    head = "🔥 Apply today" if int(v.get("score") or 0) >= URGENT_SCORE else "🆕"
+    pay = pay_text(r)
+    head = "🔥 APPLY TODAY ·" if int(v.get("score") or 0) >= URGENT_SCORE else "🆕"
     src = f" · via {r['source']}" if str(r.get("source", "")).startswith("email") else ""
     text = (f"{head} {r['title']} — {r['company'].title()}\n{pay} · fit {v['score']}/100 · "
             f"coding-test risk {v.get('coding_test_risk', '?')}{src}\n\nWhy: {v.get('reason')}\n"
@@ -345,7 +355,7 @@ def alert_text(r: dict, v: dict, folder: Path, ref: int | None = None) -> str:
                  f"Note: {v['outreach']}\n")
     if v.get("factcheck") is not None:
         n = len(v["factcheck"])
-        text += f"\n✔ Fact-checked against your resume: {'no changes' if not n else f'{n} claim(s) corrected, see fit.md'}\n"
+        text += f"\n✔ Fact-checked against your resume: {'no changes' if not n else plural(n, 'claim') + ' corrected, see fit.md'}\n"
     elif v.get("factcheck_error"):
         text += "\n⚠️ Not fact-checked (the check failed) — read the letter carefully.\n"
     text += f"\nResume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
@@ -777,7 +787,7 @@ def digest_text(state: dict, now: dt.datetime | None = None) -> str:
     applied = [e for e in tracked if any(s == "applied" for s, _ in e.get("history") or [])]
     replied = [e for e in applied if e.get("status") in ("interview", "offer")]
     if applied:
-        lines.append(f"All time: {len(applied)} applied → {len(replied)} interviews "
+        lines.append(f"All time: {len(applied)} applied → {plural(len(replied), 'interview')} "
                      f"({100 * len(replied) // len(applied)}% reply rate)")
         by_src: dict[str, list[int]] = {}
         for e in applied:
@@ -847,13 +857,25 @@ def _age(stamp: str | None) -> str:
         h = (dt.datetime.now() - dt.datetime.fromisoformat(stamp)).total_seconds() / 3600
     except ValueError:
         return stamp
-    return f"{h * 60:.0f}m ago" if h < 1 else f"{h:.1f}h ago"
+    if h < 1 / 60:  # includes clock skew between the NAS and whatever wrote the stamp
+        return "just now"
+    if h < 1:
+        return f"{h * 60:.0f}m ago"
+    return f"{h:.1f}h ago" if h < 48 else f"{h / 24:.0f}d ago"
+
+
+def _when(stamp: str | None) -> str:
+    try:
+        return f"{dt.datetime.fromisoformat(stamp):%d %b %H:%M}"
+    except (TypeError, ValueError):
+        return "?"
 
 
 def status_text(state: dict) -> str:
     runs = state.get("runs") or []
     lines = [f"Heartbeat: {_age(state.get('heartbeat'))}",
-             f"Last cycle finished: {_age(state.get('last_cycle'))} (every {INTERVAL_H:g}h)",
+             f"Last sweep: {_age(state.get('last_cycle'))} (every {interval_now():g}h now; "
+             f"{BUSY_INTERVAL_H:g}h weekdays {BUSY_HOURS[0]}-{BUSY_HOURS[1]}h, else {INTERVAL_H:g}h)",
              f"Model: {MODEL} via claude -p ({claude_ok()})",
              f"Code: {code_version()}",
              f"Postings tracked: {len(state.get('seen', {}))}"]
@@ -861,7 +883,7 @@ def status_text(state: dict) -> str:
         e = state["last_error"]
         lines.append(f"Last error {_age(e.get('at'))}: {e.get('error', '')[-400:]}")
     for r in runs[-5:]:
-        lines.append(f"- {r.get('at', '?')[5:16]}: {r.get('candidates')} cand, {r.get('new')} new, "
+        lines.append(f"- {_when(r.get('at'))}: {r.get('candidates')} cand, {r.get('new')} new, "
                      f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('dups', 0)} dup, {r.get('failed')} failed, "
                      f"${r.get('cost_usd', 0):.2f}"
                      + (f" ({r['note']})" if r.get("note") else ""))
@@ -938,7 +960,7 @@ def posting_from(arg: str) -> dict:
     key = mail_alerts.job_key("", "", url) if url else ""
     return {"id": (key if key.startswith(("li:", "js:")) else url) or "pasted:" + hashlib.sha1(pasted.encode()).hexdigest()[:12],
             "title": title or pasted.split(".")[0][:80],
-            "company": "(see description)", "lo": None, "source": "link", "url": url, "desc": pasted[:6000]}
+            "company": "(see description)", "lo": None, "source": "shared", "url": url, "desc": pasted[:6000]}
 
 
 def judge_command(arg: str) -> str:

@@ -214,13 +214,18 @@ SENT.clear()
 a.candidates = lambda: [rec("j10")]
 a.cycle()
 alert = next((s for s in SENT if "SRE j10" in s), "")
-check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 Apply today" in alert)
+check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 APPLY TODAY" in alert)
 check("alert carries who to reach, a people-search link and the note",
       "Reach out to: Head of Platform" in alert and "linkedin.com/search/results/people" in alert
       and "Checked note." in alert)
 ref10 = a.load_state()["seen"]["j10"]["ref"]
 check("fits get a ref number in the alert", f"/applied {ref10}" in alert)
-check("the fact-check's corrections reach the alert", "1 claim(s) corrected" in alert and "Checked note." in alert)
+check("the fact-check's corrections reach the alert", "1 claim corrected" in alert and "Checked note." in alert)
+check("pay reads as a clean range", a.pay_text({"lo": 11000, "hi": 14000}) == "$11,000–14,000/mo"
+      and a.pay_text({"lo": 9500}) == "from $9,500/mo" and a.pay_text({"lo": None}) == "pay not published")
+check("ages never go negative and switch to days", a._age((dt.datetime.now() + dt.timedelta(hours=3)).isoformat())
+      == "just now" and a._age((dt.datetime.now() - dt.timedelta(days=5)).isoformat()) == "5d ago")
+check("/status shows the interval in force now", f"every {a.interval_now():g}h now" in a.status_text({}))
 
 v = a.factcheck(rec("x"), VERDICT)
 check("fact-check replaces the drafts with the checked text", v["letter"] == ["checked p1", "checked p2"]
@@ -385,7 +390,7 @@ check("jobs from alert emails are judged and alerted",
       "li:4012345678" in st["seen"] and any("via email:linkedin" in s for s in SENT))
 check("the regex filters apply to email jobs too", "li:4099999999" not in st["seen"])
 check("the pay floor applies to email jobs that show a salary", "li:4077777777" not in st["seen"])
-check("email salaries are parsed to monthly SGD", any("$10,000–14000/mo" in s for s in SENT))
+check("email salaries are parsed to monthly SGD", any("$10,000–14,000/mo" in s for s in SENT))
 for text, want in [("S$10K - S$14K / month", (10000, 14000)), ("$120,000 - $150,000 a year", (10000, 12500)),
                    ("SGD 8,000 - 10,000 per month", (8000, 10000)), ("$50 - $70 per hour", (None, None)),
                    ("Competitive", (None, None)), ("$144K/yr", (12000, None))]:
@@ -427,7 +432,7 @@ a.poll_commands(a.load_state(), 1)
 st = a.load_state()
 check("the pasted description is judged against the shared link",
       "li:4011111111" in st["seen"] and st["seen"]["li:4011111111"]["url"] == "https://www.linkedin.com/jobs/view/4011111111/"
-      and any("Apply today" in s for s in SENT) and "pending_judge" not in st)
+      and any("APPLY TODAY" in s for s in SENT) and "pending_judge" not in st)
 SENT.clear()
 UPDATES[:] = [msg(54, jd)]
 a.poll_commands(a.load_state(), 1)
