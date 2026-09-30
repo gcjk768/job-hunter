@@ -3,8 +3,11 @@
 # (`claude -p`, tools disabled), drafts resume + cover letter into ./tailored-auto/, and posts to
 # Telegram. Never applies.
 #
-# Share layout:  compose.yaml  Dockerfile  .env  build/*.py   (tailored-auto/ and build/.nas_state.json appear on first run)
-# Code changes: copy build/*.py and restart. Dockerfile changes: rebuild the project.
+# Deploy from a git clone (share docker/job-hunter = the repo root):
+#   git clone https://github.com/gcjk768/job-hunter.git   # then add the private files below
+#   sh deploy/nas/update.sh                               # first start, and every update after
+# Private files at the repo root, all gitignored: .env, build/content.py, build/my_profile.py.
+# tailored-auto/, build/.nas_state.json and build/backups/ appear on first run.
 #
 # .env (never commit it):
 #   CLAUDE_CODE_OAUTH_TOKEN=...   # from `claude setup-token` on your PC; bills your Claude subscription
@@ -19,7 +22,7 @@ services:
     restart: unless-stopped
     working_dir: /app
     env_file:
-      - path: .env
+      - path: ../../.env                 # paths are relative to this file: the repo root is ../..
         required: false
     environment:
       TZ: Asia/Singapore
@@ -35,7 +38,7 @@ services:
       EXTRACT_MODEL: haiku             # reads alert emails; cheap is fine
       HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
     volumes:
-      - ./:/app
+      - ../..:/app                       # the code runs from the clone, so `git pull` + restart updates it
     healthcheck:                       # unhealthy if the heartbeat is older than 2h (it refreshes every 30m)
       test: ["CMD", "python", "-c", "import json,datetime as d,sys; s=json.load(open('build/.nas_state.json')); sys.exit((d.datetime.now()-d.datetime.fromisoformat(s['heartbeat'])).total_seconds()>7200)"]
       interval: 10m

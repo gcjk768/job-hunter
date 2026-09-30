@@ -60,6 +60,32 @@ def canonical_url(url: str) -> str:
     return url.split("?")[0] if "linkedin.com" in url or "jobstreet" in url else url
 
 
+PAY = re.compile(r"(?:S\$|SGD|US\$|USD|\$)\s*([\d][\d.,]*)\s*(k)?"
+                 r"(?:\s*(?:-|–|—|to)\s*(?:S\$|SGD|US\$|USD|\$)?\s*([\d][\d.,]*)\s*(k)?)?", re.I)
+
+
+def parse_pay(text: str) -> tuple[int | None, int | None]:
+    """(min, max) per month from an alert's salary text, e.g. "S$10K - S$14K / month" or
+    "$120,000 - $150,000 a year". (None, None) when there is none or it is hourly/unclear."""
+    m = PAY.search(text or "")
+    if not m or re.search(r"hour|/hr\b|per hr|daily|/day", text, re.I):
+        return None, None
+
+    def num(v: str | None, k: str | None) -> float | None:
+        if not v:
+            return None
+        n = float(v.replace(",", ""))
+        return n * 1000 if k else n
+
+    lo, hi = num(m.group(1), m.group(2)), num(m.group(3), m.group(4) or m.group(2))
+    yearly = re.search(r"year|annum|annual|/yr|\bp\.?a\.?\b|yearly", text, re.I) or (lo or 0) >= 40000
+    if yearly:
+        lo, hi = lo / 12 if lo else lo, hi / 12 if hi else hi
+    if not lo or lo < 500:  # not a monthly salary we can trust
+        return None, None
+    return round(lo), round(hi) if hi else None
+
+
 def job_key(title: str, company: str, url: str) -> str:
     """Stable id: the board's own job id when the URL carries one, else title+company (catches the same
     role arriving from two boards)."""

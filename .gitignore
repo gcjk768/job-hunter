@@ -26,6 +26,7 @@
 /deploy/nas/*
 !/deploy/nas/compose.yaml
 !/deploy/nas/Dockerfile
+!/deploy/nas/update.sh
 
 /docs/*
 !/docs/architecture.drawio

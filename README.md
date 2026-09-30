@@ -25,6 +25,9 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 - **Coverage beyond scraping, without scraping.** LinkedIn, JobStreet, Glassdoor and Indeed stay login-walled to a crawler, but they all email you their alerts. With `IMAP_*` set, the watcher reads those emails read-only (`BODY.PEEK`, nothing marked read), has a cheap model (`EXTRACT_MODEL`, default `haiku`) list the postings in each, and runs them through the same regex filters and judge (`build/mail_alerts.py`).
 - **Built to get a reply, not just a draft.** Each fit comes with who to contact (likely hiring-manager titles plus a LinkedIn people-search link) and a ≤280-character connection note, also saved as `outreach.md`. Scores ≥ `URGENT_SCORE` are flagged "🔥 Apply today", and sweeps run every `BUSY_INTERVAL_HOURS` (2h) during weekday working hours so you see postings early.
 - **Outcomes close the loop.** Every fit gets a ref number. `/applied 12`, `/interview 12`, `/rejected 12`… record what happened; `FOLLOWUP_DAYS` after `/applied` with no update you get a nudge with a drafted follow-up email; `/interview` builds a prep pack; a Sunday digest reports reply rate by source and whether `FIT_THRESHOLD` looks miscalibrated.
+- **Every draft is fact-checked.** Before a fit is drafted, a second `claude -p` pass compares the tagline, summary, cover letter and outreach note with the resume and removes any claim it doesn't support (a wrong year, tool, certification or employer). The alert says how many claims it corrected and `fit.md` lists them; if the check itself fails, the alert says the draft is unchecked (`FACTCHECK=0` turns it off).
+- **Judged on the real job description where one exists.** MyCareersFuture via its API, Greenhouse via its per-job endpoint, and Ashby and Lever from the description their board API already returns. Only Workday, amazon.jobs, Apple and alert-email postings are judged on title, company and whatever snippet came with them.
+- **One role, one alert.** The same job on MyCareersFuture, a LinkedIn alert and the company's own board is recognised by a normalised company + title fingerprint (legal suffixes, "Singapore", punctuation and case removed) and judged once.
 - **The model can read, not act.** Every `claude -p` call runs with `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` and an empty temp directory as its working directory. A job posting that tries prompt injection has no tools and no project files (or `.env`) within reach.
 - **Failures are classified.** A CLI, auth, rate-limit or network failure (`ClaudeError`) is transient and retried next cycle forever. A reply without a valid structured verdict counts toward `MAX_ATTEMPTS`.
 - **The self-test checks behaviour, not syntax.** A `\b` written through a shell heredoc once collapsed into a literal backspace byte, and a filter silently matched nothing. `build/selftest.py` asserts 14 filter behaviours and scans the source for any C0 control character.
@@ -37,7 +40,7 @@ Numbers match the diagram.
 1. **Sweep.** `weekly_sweep.collect()` queries the MyCareersFuture public API (20 search terms × 4 pages). It's the only source that publishes a salary band and a minimum-years figure. `job_sources.fetch_all()` adds company boards: 26 Greenhouse, 6 Ashby, 7 Lever, plus amazon.jobs, Workday tenants, NVIDIA's Workday site (Singapore facet) and, optionally, Apple via headless Playwright. The regex filters and the pay floor are applied here.
 2. **Dedup.** Each posting's ID is checked against `build/.nas_state.json`. Only IDs not seen before continue.
 3. **Cap.** At most `MAX_PER_CYCLE` new postings go to the model.
-4. **Judge.** `judge()` fetches the job description (MCF only; career pages are judged on title and company) and calls `claude -p --output-format json --json-schema <verdict schema>`. The verdict covers: suitable, 0–100 score, reason, honest gaps, coding-test risk, tagline, summary, project picks and cover-letter paragraphs.
+4. **Judge.** `judge()` uses the full job description where the source has one (MyCareersFuture, Greenhouse, Ashby, Lever; the rest are judged on title, company and any snippet) and calls `claude -p --output-format json --json-schema <verdict schema>`. The verdict covers: suitable, 0–100 score, reason, honest gaps, coding-test risk, tagline, summary, project picks, cover-letter paragraphs, who to contact and an outreach note. A second pass fact-checks the drafts against the resume.
 5. **Inference.** The Claude Code CLI in the container calls Claude (default `sonnet`), authenticated with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (subscription) or `ANTHROPIC_API_KEY`. Each run records its `total_cost_usd`.
 6. **Gate.** The posting has to be `suitable`, score ≥ `FIT_THRESHOLD` (70), and come with a letter.
 7. **Draft.** `build_docs.py` renders an ATS-plain resume and cover letter plus a `fit.md` into `tailored-auto/<date_company_role>/`.
@@ -95,7 +98,9 @@ Environment (put the secrets in `.env`, which is never committed):
 | `FIT_THRESHOLD` | `70` | Minimum score before drafting and alerting |
 | `HEARTBEAT_MIN` | `30` | How often the idle loop rewrites the heartbeat in the state file |
 | `MAX_ATTEMPTS` | `3` | Cycles a posting may fail with unparseable model output before it's given up |
-| `SEEN_DAYS` | `180` | Postings older than this are forgotten, keeping the state file small |
+| `SEEN_DAYS` | `180` | Postings older than this are forgotten, keeping the state file small (tracked applications are kept) |
+| `FACTCHECK` | `1` | `0` skips the second pass that checks each draft's claims against the resume |
+| `BACKUP_DAYS` | `30` | Daily copies of the state file kept in `build/backups/` |
 
 ### Telegram commands
 
@@ -123,7 +128,17 @@ Every cycle, including one with nothing new, writes `last_cycle` and a `runs` en
 
 ### On a NAS (Docker)
 
-`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the project folder. Put `compose.yaml`, `Dockerfile`, `.env` and `build/` in the share and create the project. After a code-only change, copy `build/*.py` and restart; rebuild only when the Dockerfile changes. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude.
+Deploy from a git clone so updates are one command:
+
+```sh
+cd /volume1/docker                                    # the UGOS docker share
+git clone https://github.com/gcjk768/job-hunter.git   # a private repo needs a token or deploy key
+cd job-hunter
+# add the private, gitignored files: .env, build/content.py, build/my_profile.py
+sh deploy/nas/update.sh                               # first start, and every update after
+```
+
+`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the repo root at `/app`, so the code runs straight from the clone. `update.sh` does `git pull --ff-only`, rebuilds the image only when the Dockerfile changed, and restarts the container; `/status` then shows the deployed commit. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude. The state file is copied to `build/backups/` once a day, and the last `BACKUP_DAYS` copies are kept; to restore, stop the container and copy one back over `build/.nas_state.json`.
 
 ## Project structure
 
@@ -132,13 +147,13 @@ build/
   nas_agent.py          # the loop: sweep -> dedup -> judge -> draft -> alert
   weekly_sweep.py       # MyCareersFuture sweep + all regex filters
   job_sources.py        # Greenhouse / Ashby / Lever / amazon.jobs / Workday / NVIDIA / Apple
-  mail_alerts.py        # read-only IMAP reader for LinkedIn / JobStreet / Glassdoor / Indeed alert emails
+  mail_alerts.py        # read-only IMAP reader for alert emails + salary parsing
   build_docs.py         # ATS-plain resume + cover letter (.docx)
   selftest.py           # behaviour checks + control-character scan
   test_nas_agent.py     # offline tests: cycles, retries, commands, tracking, alert emails, watchdog
   watchdog.py           # PC-side: alerts when the NAS stops reporting
   *_example.py          # public stand-ins for the gitignored personal files
-deploy/nas/            # compose.yaml + Dockerfile for the NAS
+deploy/nas/             # compose.yaml, Dockerfile and update.sh for the NAS
 .github/workflows/      # CI: both test scripts on every push
 docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ```
@@ -146,13 +161,13 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 10 files clean of control chars`.
-- `python build/test_nas_agent.py` runs 61 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence), every Telegram command, outcome tracking, follow-ups and the digest, alert-email parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
+- `python build/test_nas_agent.py` runs 81 offline checks: the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, outcome tracking, follow-ups, the digest and backups, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
 - GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations
 
 - **No login-walled scraping.** LinkedIn, Glassdoor, NodeFlair and JobStreet sit behind logins or bot checks, and this project doesn't try to get around them. Their alert *emails* are read instead; those carry title, company, location and sometimes pay, but not the full description, so they're judged like career-page postings (paste the JD into `/judge` for a full read).
-- **Career-page postings have no job description in the prompt.** They're judged on title and company only, so those scores are less reliable than the MCF ones.
+- **Some postings have no job description in the prompt.** Workday, amazon.jobs, Apple and alert-email postings are judged on title, company and any snippet, so those scores are less reliable than the ones with a full description. `/judge <url> <pasted JD>` gives any of them a full read.
 - **JSON-file state, single instance.** That's fine for one container on one NAS. Running more than one would need a real store with locking.
 - **The regex filters are Singapore- and profile-specific.** They're tuned for one person's search, not written as a general-purpose product.
 - **Workday tenants can't be guessed.** Only tenants with verified site IDs are included. The others returned 404/422.

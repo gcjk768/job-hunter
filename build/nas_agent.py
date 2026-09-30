@@ -75,6 +75,8 @@ URGENT_SCORE = int(os.environ.get("URGENT_SCORE", "85"))  # alerts at or above t
 FOLLOWUP_DAYS = int(os.environ.get("FOLLOWUP_DAYS", "7"))
 DIGEST_WEEKDAY = int(os.environ.get("DIGEST_WEEKDAY", "6"))  # Monday=0 … Sunday=6, sent after 09:00
 EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "haiku")  # reading alert emails is simple; keep it cheap
+FACTCHECK = os.environ.get("FACTCHECK", "1") != "0"  # second pass: every claim in a draft must be in the resume
+BACKUP_DAYS = int(os.environ.get("BACKUP_DAYS", "30"))  # daily copies of the state file kept in build/backups
 OUTCOMES = {"/applied": "applied", "/interview": "interview", "/offer": "offer",
             "/rejected": "rejected", "/ghosted": "ghosted"}
 # ponytail: caps cloud spend per cycle; the rest stay unseen and roll into the next cycle.
@@ -175,6 +177,23 @@ def claude(prompt: str, schema: dict | None = None, model: str | None = None):
     return (out.get("result") or "").strip()
 
 
+def code_version() -> str:
+    """The deployed git commit when running from a clone (deploy/nas/update.sh), else 'copied files'."""
+    git = ROOT / ".git"
+    try:
+        head = (git / "HEAD").read_text().strip()
+        if not head.startswith("ref: "):
+            return head[:7]
+        ref = head[5:]
+        if (git / ref).exists():
+            return f"{ref.split('/')[-1]}@{(git / ref).read_text().strip()[:7]}"
+        packed = (git / "packed-refs").read_text()
+        m = re.search(rf"^([0-9a-f]{{40}}) {re.escape(ref)}$", packed, re.M)
+        return f"{ref.split('/')[-1]}@{m.group(1)[:7]}" if m else ref
+    except OSError:
+        return "copied files (not a git clone)"
+
+
 def claude_ok() -> str:
     try:
         v = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=30)
@@ -193,7 +212,15 @@ def verdict_schema() -> dict:
 
 
 def description(rec: dict) -> str:
-    """MCF job text; career-page sources have none, so the model judges on title + company."""
+    """The job text: MCF via its API, Greenhouse via the per-job endpoint (Ashby and Lever arrive with
+    rec["desc"] already filled by job_sources). Anything else is judged on title + company."""
+    if rec.get("jd_url"):
+        try:
+            req = urllib.request.Request(rec["jd_url"], headers=sweep.UA)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return job_sources._plain(json.load(r).get("content")) or "(empty description)"
+        except Exception as exc:
+            return f"(description unavailable: {exc})"
     if rec.get("source") != "MyCareersFuture":
         return "(not available — judge on title and company)"
     try:
@@ -218,6 +245,51 @@ def judge(rec: dict) -> dict:
     return verdict
 
 
+FACTCHECK_PROMPT = """You are fact-checking a job application drafted for the candidate below. The ONLY
+source of truth about him is the RESUME. Check every factual claim about the candidate in the DRAFT
+(employers, titles, dates, years of experience, numbers, tools, certifications, achievements).
+
+Return the draft corrected: remove or soften any claim the resume does not support, and keep everything
+else exactly as written (same wording, same paragraph count). In "issues", list each change as
+"<claim> -> <what you did and why>"; an empty list means the draft was already accurate.
+
+RESUME:
+{profile}
+
+DRAFT (for {title} at {company}):
+Tagline: {tagline}
+Summary: {summary}
+Outreach note: {outreach}
+Cover letter paragraphs:
+{letter}"""
+FACTCHECK_SCHEMA = {"type": "object", "additionalProperties": False,
+                    "required": ["issues", "tagline", "summary", "outreach", "letter"],
+                    "properties": {"issues": {"type": "array", "items": {"type": "string"}},
+                                   "tagline": {"type": "string"}, "summary": {"type": "string"},
+                                   "outreach": {"type": "string"},
+                                   "letter": {"type": "array", "items": {"type": "string"}}}}
+
+
+def factcheck(rec: dict, v: dict) -> dict:
+    """Second pass on a fit's drafts. On failure the drafts go out unchanged but marked unchecked."""
+    if not FACTCHECK:
+        return v
+    try:
+        got = claude(FACTCHECK_PROMPT.format(
+            profile=profile(), title=rec["title"], company=rec["company"], tagline=v.get("tagline", ""),
+            summary=v.get("summary", ""), outreach=v.get("outreach", ""),
+            letter="\n\n".join(f"[{i + 1}] {p}" for i, p in enumerate(v.get("letter") or []))), FACTCHECK_SCHEMA)
+    except Exception as exc:
+        return dict(v, factcheck=None, factcheck_error=str(exc)[:200])
+    fixed = dict(v, factcheck=got.get("issues") or [])
+    for k in ("tagline", "summary", "outreach"):
+        if got.get(k):
+            fixed[k] = got[k]
+    if got.get("letter"):
+        fixed["letter"] = got["letter"]
+    return fixed
+
+
 def build(rec: dict, v: dict) -> Path:
     key = build_docs._slug(f"{dt.date.today():%Y%m%d}_{rec['company']}_{rec['title']}")[:90]
     outdir = OUT / key
@@ -233,7 +305,11 @@ def build(rec: dict, v: dict) -> Path:
     (outdir / "fit.md").write_text(
         f"# {rec['title']} — {rec['company']}\n\n{rec.get('url', '')}\n\n"
         f"Score {v.get('score')} · coding-test risk {v.get('coding_test_risk')}\n\n"
-        f"Why: {v.get('reason')}\n\nGaps: {v.get('gaps')}\n", encoding="utf-8")
+        f"Why: {v.get('reason')}\n\nGaps: {v.get('gaps')}\n"
+        + ("" if v.get("factcheck") is None else
+           "\nFact-check against the resume: "
+           + ("no changes needed.\n" if not v["factcheck"] else "\n" + "\n".join(f"- {i}" for i in v["factcheck"]) + "\n")),
+        encoding="utf-8")
     if v.get("outreach"):
         links = "\n".join(f"- {t}: {people_search(rec['company'], t)}" for t in v.get("contact_titles") or [])
         (outdir / "outreach.md").write_text(
@@ -263,6 +339,11 @@ def alert_text(r: dict, v: dict, folder: Path, ref: int | None = None) -> str:
         who = v.get("contact_titles") or ["the hiring manager"]
         text += (f"\n👤 Reach out to: {', '.join(who)}\n{people_search(r['company'], who[0])}\n"
                  f"Note: {v['outreach']}\n")
+    if v.get("factcheck") is not None:
+        n = len(v["factcheck"])
+        text += f"\n✔ Fact-checked against your resume: {'no changes' if not n else f'{n} claim(s) corrected, see fit.md'}\n"
+    elif v.get("factcheck_error"):
+        text += "\n⚠️ Not fact-checked (the check failed) — read the letter carefully.\n"
     text += f"\nResume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
     if ref:
         text += f"Ref #{ref} — send /applied {ref} once you've applied.\n"
@@ -345,6 +426,8 @@ def cycle() -> None:
         # First run: everything on the boards today is old news (the PC sweep already covered it).
         for r in jobs:
             seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": None, "at": _now()}
+            if fingerprint(r["company"], r["title"]):
+                state.setdefault("fps", {})[fingerprint(r["company"], r["title"])] = ident(r)
         _finish(state, {"candidates": len(jobs), "new": len(jobs), "judged": 0, "fits": 0, "failed": 0,
                         "note": "baseline"})
         telegram(f"Job watcher online on the NAS. Baseline: {len(jobs)} current postings; "
@@ -353,6 +436,21 @@ def cycle() -> None:
         return
 
     new = [r for r in jobs if ident(r) not in seen]
+    fps = state.setdefault("fps", {})
+    fresh, dups, batch = [], 0, {}
+    for r in new:
+        # The same role often shows up on MCF, a LinkedIn alert and the company's own board, sometimes in
+        # the same sweep: judge it once.
+        fp = fingerprint(r["company"], r["title"])
+        first = batch.get(fp) or (fps.get(fp) if fps.get(fp) in seen else None)
+        if fp and first and first != ident(r):
+            seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": None, "at": _now(), "dup_of": first}
+            dups += 1
+        else:
+            fresh.append(r)
+            if fp:
+                batch[fp] = ident(r)
+    new = fresh
     print(f"[{dt.datetime.now():%F %T}] {len(jobs)} candidates, {len(new)} new")
     judged = fits = failed = 0
     last_fail = ""
@@ -376,23 +474,39 @@ def cycle() -> None:
             continue
         judged += 1
         attempts.pop(ident(r), None)
+        if fingerprint(r["company"], r["title"]):
+            fps[fingerprint(r["company"], r["title"])] = ident(r)
         fit = is_fit(v)
         seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": v.get("score"), "suitable": bool(fit),
                           "why": v.get("reason"), "url": r.get("url", ""), "at": _now()}
         print(f"  {v.get('score'):>3} {'FIT ' if fit else 'skip'} {r['title']} @ {r['company']}")
         if fit:
             fits += 1
+            v = factcheck(r, v)
             folder = build(r, v)
             telegram(alert_text(r, v, folder, track(state, ident(r), r, v, folder)))
         save_state(state)
     _finish(state, {"candidates": len(jobs), "new": len(new), "judged": judged, "fits": fits,
-                    "failed": failed, "note": "; ".join(x for x in (last_fail[:300], mail_note) if x)})
+                    "failed": failed, "dups": dups,
+                    "note": "; ".join(x for x in (last_fail[:300], mail_note) if x)})
     if failed and not judged:
         # Every judge call failed: usually the CLI is signed out, rate-limited or offline. Say so instead of
         # silently retrying forever.
         telegram(f"⚠️ Job watcher: all {failed} judge calls failed ({last_fail[:200]}). "
                  f"Check the Claude login (CLAUDE_CODE_OAUTH_TOKEN) or limits. Postings stay unseen and retry "
                  f"next cycle.")
+
+
+COMPANY_NOISE = re.compile(r"\b(pte|ltd|limited|inc|llc|plc|corp|corporation|co|company|group|holdings|"
+                           r"technologies|technology|singapore|sg|asia|pacific|apac|the)\b")
+
+
+def fingerprint(company: str, title: str) -> str:
+    """company|title with legal suffixes, locations and punctuation removed; '' when too vague to trust."""
+    norm = lambda t: " ".join(re.sub(r"[^a-z0-9]+", " ", t.lower()).split())  # noqa: E731
+    co = " ".join(COMPANY_NOISE.sub(" ", norm(company)).split())
+    ti = " ".join(re.sub(r"\b(singapore|sg|remote|hybrid)\b", " ", norm(title)).split())
+    return f"{co}|{ti}" if len(co) >= 2 and ti else ""
 
 
 def prune(state: dict) -> None:
@@ -405,6 +519,7 @@ def prune(state: dict) -> None:
         v.setdefault("at", _now())
         if v["at"] < cutoff and not v.get("ref"):  # tracked applications are kept for the record
             del seen[key]
+    state["fps"] = {fp: k for fp, k in (state.get("fps") or {}).items() if k in seen}
 
 
 def _finish(state: dict, run: dict) -> None:
@@ -430,7 +545,7 @@ def record_error(text: str) -> None:
 
 EXTRACT_PROMPT = """Below is a job-alert email from a job board. List every individual job posting in it.
 For each: the job title, the hiring company, the location as written, the link to that job (copy the URL
-exactly from the [...] after it), and any salary or short snippet shown. Skip ads, courses, "people also
+exactly from the [...] after it), the salary exactly as shown (empty if none), and any short snippet. Skip ads, courses, "people also
 viewed" profiles and settings links. If the email contains no job postings, return an empty list.
 
 FROM: {sender}
@@ -439,9 +554,10 @@ SUBJECT: {subject}
 {text}"""
 EXTRACT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["jobs"], "properties": {
     "jobs": {"type": "array", "items": {"type": "object", "additionalProperties": False,
-                                        "required": ["title", "company", "location", "url", "snippet"],
+                                        "required": ["title", "company", "location", "url", "salary", "snippet"],
                                         "properties": {k: {"type": "string"} for k in
-                                                       ("title", "company", "location", "url", "snippet")}}}}}
+                                                       ("title", "company", "location", "url", "salary",
+                                                        "snippet")}}}}}
 
 
 def alert_jobs(mail: dict) -> list[dict]:
@@ -457,11 +573,15 @@ def alert_jobs(mail: dict) -> list[dict]:
             continue
         if sweep.COMPANY_DROP.search(company):
             continue
+        lo, hi = mail_alerts.parse_pay(j.get("salary") or "")
+        if lo is not None and lo < sweep.SALARY_FLOOR:  # the same pay floor as the board sweep, before any judging
+            continue
         url = mail_alerts.canonical_url(j["url"])
         out.append({"id": mail_alerts.job_key(title, company, url), "title": title, "company": company,
-                    "url": url, "lo": None, "source": f"email:{board}",
+                    "url": url, "lo": lo, "hi": hi, "source": f"email:{board}",
                     "desc": f"(from a {board} job-alert email; the full description is not available — judge on "
-                            f"title, company and this) Location: {j['location']}. {j['snippet']}"})
+                            f"title, company and this) Location: {j['location']}. Salary: {j.get('salary') or 'n/s'}. "
+                            f"{j['snippet']}"})
     return out
 
 
@@ -595,6 +715,7 @@ ROLE: {title} at {company}
 def chores(now: dt.datetime | None = None) -> None:
     """Time-based jobs run from the idle loop: follow-up reminders (daily) and the weekly digest."""
     now = now or dt.datetime.now()
+    backup_state(now)
     if now.hour < 9:
         return
     state = load_state()
@@ -621,6 +742,21 @@ def chores(now: dt.datetime | None = None) -> None:
         telegram(digest_text(state, now))
         state["last_digest"] = week
         save_state(state)
+
+
+def backup_state(now: dt.datetime | None = None) -> None:
+    """One copy of the state file per day in build/backups, the last BACKUP_DAYS kept. The tracked
+    applications live only here, so a bad write or an accidental delete must be recoverable."""
+    if not STATE.exists():
+        return
+    folder = STATE.parent / "backups"
+    target = folder / f"nas_state-{(now or dt.datetime.now()):%Y-%m-%d}.json"
+    if target.exists():
+        return
+    folder.mkdir(exist_ok=True)
+    target.write_bytes(STATE.read_bytes())
+    for old in sorted(folder.glob("nas_state-*.json"))[:-BACKUP_DAYS]:
+        old.unlink()
 
 
 def digest_text(state: dict, now: dt.datetime | None = None) -> str:
@@ -713,13 +849,15 @@ def status_text(state: dict) -> str:
     lines = [f"Heartbeat: {_age(state.get('heartbeat'))}",
              f"Last cycle finished: {_age(state.get('last_cycle'))} (every {INTERVAL_H:g}h)",
              f"Model: {MODEL} via claude -p ({claude_ok()})",
+             f"Code: {code_version()}",
              f"Postings tracked: {len(state.get('seen', {}))}"]
     if state.get("last_error"):
         e = state["last_error"]
         lines.append(f"Last error {_age(e.get('at'))}: {e.get('error', '')[-400:]}")
     for r in runs[-5:]:
         lines.append(f"- {r.get('at', '?')[5:16]}: {r.get('candidates')} cand, {r.get('new')} new, "
-                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('failed')} failed, ${r.get('cost_usd', 0):.2f}"
+                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('dups', 0)} dup, {r.get('failed')} failed, "
+                     f"${r.get('cost_usd', 0):.2f}"
                      + (f" ({r['note']})" if r.get("note") else ""))
     return "\n".join(lines)
 
@@ -789,6 +927,7 @@ def judge_command(arg: str) -> str:
                                                    "url": rec.get("url", ""), "at": _now(), "via": "judge"}
     save_state(state)
     if fit:
+        v = factcheck(rec, v)
         folder = build(rec, v)
         state = load_state()
         ref = track(state, rec.get("uuid") or rec["id"], rec, v, folder)

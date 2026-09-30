@@ -31,9 +31,13 @@ VERDICT = {"suitable": True, "score": 85, "reason": "fits", "gaps": "none", "cod
            "contact_titles": ["Head of Platform"], "outreach": "Hi, I run EKS platforms and saw your SRE role."}
 EXTRACTED = {"jobs": [
     {"title": "Senior SRE", "company": "Globex", "location": "Singapore", "snippet": "EKS, Terraform",
-     "url": "https://www.linkedin.com/comm/jobs/view/4012345678/?trackingId=abc&refId=x"},
+     "url": "https://www.linkedin.com/comm/jobs/view/4012345678/?trackingId=abc&refId=x", "salary": "S$10K - S$14K / month"},
     {"title": "Marketing Manager", "company": "Globex", "location": "Singapore", "snippet": "",
-     "url": "https://www.linkedin.com/comm/jobs/view/4099999999/"}]}
+     "url": "https://www.linkedin.com/comm/jobs/view/4099999999/", "salary": ""},
+    {"title": "Junior DevOps Engineer", "company": "Hooli", "location": "Singapore", "snippet": "",
+     "url": "https://www.linkedin.com/comm/jobs/view/4077777777/", "salary": "S$1,200 - S$1,500 / month"}]}
+FACTCHECK = {"issues": ["'10 years of Kubernetes' -> removed, the resume shows 4"], "tagline": "t",
+             "summary": "s", "outreach": "Checked note.", "letter": ["checked p1", "checked p2"]}
 
 
 class Resp(io.BytesIO):
@@ -56,6 +60,8 @@ def fake_urlopen(req, data=None, timeout=0):
         return Resp(json.dumps({"title": "Platform Engineer", "hiringCompany": {"name": "Acme"},
                                 "salary": {"minimum": 9000, "maximum": 12000}, "description": "<p>k8s</p>",
                                 "metadata": {"jobDetailsUrl": "https://mcf/job"}}).encode())
+    if url.startswith("https://boards-api.greenhouse.io/v1/boards/acme/jobs/77"):
+        return Resp(json.dumps({"content": "&lt;p&gt;Own our &lt;b&gt;EKS&lt;/b&gt; fleet&lt;/p&gt;"}).encode())
     if url.startswith("https://example.com"):
         return Resp(b"<html><title>SRE at Example</title><body>" + b"Run Kubernetes. " * 30 + b"</body></html>")
     raise AssertionError(f"unexpected URL {url}")
@@ -73,7 +79,8 @@ def fake_run(cmd, input=None, cwd=None, **kw):
     assert cwd and not os.listdir(cwd), "must run in an empty directory"
     out = {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}
     if "--json-schema" in cmd:
-        got = EXTRACTED if '"jobs"' in cmd[cmd.index("--json-schema") + 1] else VERDICT
+        schema = cmd[cmd.index("--json-schema") + 1]
+        got = EXTRACTED if '"jobs"' in schema else FACTCHECK if '"issues"' in schema else VERDICT
         out.update(result=json.dumps(got), structured_output=got)
     elif "which fits best?" in input:
         out["result"] = "Role X fits best."
@@ -120,7 +127,7 @@ a.candidates = lambda: [rec("j1"), rec("j2")]
 SENT.clear()
 a.cycle()
 check("a fitting new posting is alerted", any("SRE j2" in s for s in SENT))
-check("the cycle's claude cost is recorded", a.load_state()["runs"][-1]["cost_usd"] == 0.01)
+check("the cycle's claude cost is recorded (judge + fact-check)", a.load_state()["runs"][-1]["cost_usd"] == 0.02)
 check("the verdict schema pins projects to the real library",
       a.verdict_schema()["properties"]["projects"]["items"]["enum"] == a.PROJECTS)
 
@@ -198,9 +205,42 @@ alert = next((s for s in SENT if "SRE j10" in s), "")
 check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 Apply today" in alert)
 check("alert carries who to reach, a people-search link and the note",
       "Reach out to: Head of Platform" in alert and "linkedin.com/search/results/people" in alert
-      and "I run EKS platforms" in alert)
+      and "Checked note." in alert)
 ref10 = a.load_state()["seen"]["j10"]["ref"]
 check("fits get a ref number in the alert", f"/applied {ref10}" in alert)
+check("the fact-check's corrections reach the alert", "1 claim(s) corrected" in alert and "Checked note." in alert)
+
+v = a.factcheck(rec("x"), VERDICT)
+check("fact-check replaces the drafts with the checked text", v["letter"] == ["checked p1", "checked p2"]
+      and v["factcheck"] == FACTCHECK["issues"])
+real_run = a.subprocess.run
+a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "rate limited")
+v = a.factcheck(rec("x"), VERDICT)
+a.subprocess.run = real_run
+check("a failed fact-check keeps the drafts but says so",
+      v["letter"] == VERDICT["letter"] and "Not fact-checked" in a.alert_text(rec("x"), v, TMP / "d"))
+
+# --- full job descriptions and cross-source dedup -------------------------------------------------
+import job_sources  # noqa: E402
+
+check("Greenhouse's double-escaped HTML becomes plain text",
+      job_sources._plain("&lt;p&gt;Run &amp;amp; own&lt;/p&gt;") == "Run & own")
+check("Greenhouse descriptions are fetched for judging",
+      a.description({"jd_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs/77"}) == "Own our EKS fleet")
+check("records that carry a description (Ashby/Lever) use it",
+      "Own our fleet" in a.PROMPT.format(today="", floor=1, excluded="", profile="", title="", company="", pay="",
+                                         years="", desc={"desc": "Own our fleet"}.get("desc"), projects=[]))
+check("fingerprints ignore legal suffixes, location and case",
+      a.fingerprint("Globex Asia Pte. Ltd.", "Senior SRE (Singapore)") == a.fingerprint("GLOBEX", "senior sre"))
+check("too-vague companies are never deduped", a.fingerprint("?", "SRE") == "")
+SENT.clear()
+a.candidates = lambda: [dict(rec("mcf-1"), company="Wayne Enterprises Pte Ltd", title="Platform Engineer"),
+                        dict(rec("li:1"), company="Wayne Enterprises", title="Platform Engineer (Singapore)")]
+a.cycle()
+st = a.load_state()
+check("the same role from two sources is judged and alerted once",
+      st["seen"]["li:1"].get("dup_of") == "mcf-1" and sum("Platform Engineer" in s for s in SENT) == 1
+      and st["runs"][-1]["dups"] == 1)
 
 folder = real_build(rec("j10") | {"url": "https://x/job"},
                     dict(VERDICT, projects=a.PROJECTS[:3], tagline="t", summary="s"))
@@ -256,6 +296,12 @@ CALLS.clear()
 for _ in range(3):
     a.chores(monday10)
 a.subprocess.run = real_run
+check("a daily state backup is written", (a.STATE.parent / "backups" / f"nas_state-{monday10:%Y-%m-%d}.json").exists())
+for i in range(a.BACKUP_DAYS + 5):
+    a.backup_state(monday10 - dt.timedelta(days=i))
+check("only the last BACKUP_DAYS backups are kept",
+      len(list((a.STATE.parent / "backups").glob("nas_state-*.json"))) == a.BACKUP_DAYS)
+check("/status shows the deployed commit", "@" in a.code_version() or "copied files" in a.code_version())
 check("a failing follow-up draft still nudges, once, without retrying every loop",
       sum("⏰" in s for s in SENT) == 1 and any("couldn't draft one" in s for s in SENT))
 
@@ -326,6 +372,12 @@ check("alert emails are read with the cheap extract model",
 check("jobs from alert emails are judged and alerted",
       "li:4012345678" in st["seen"] and any("via email:linkedin" in s for s in SENT))
 check("the regex filters apply to email jobs too", "li:4099999999" not in st["seen"])
+check("the pay floor applies to email jobs that show a salary", "li:4077777777" not in st["seen"])
+check("email salaries are parsed to monthly SGD", any("$10,000–14000/mo" in s for s in SENT))
+for text, want in [("S$10K - S$14K / month", (10000, 14000)), ("$120,000 - $150,000 a year", (10000, 12500)),
+                   ("SGD 8,000 - 10,000 per month", (8000, 10000)), ("$50 - $70 per hour", (None, None)),
+                   ("Competitive", (None, None)), ("$144K/yr", (12000, None))]:
+    check(f"parse_pay({text!r})", mail_alerts.parse_pay(text) == want)
 check("processed emails are remembered", "<a1@li>" in st["mail_done"])
 SENT.clear()
 a.cycle()

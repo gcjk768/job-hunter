@@ -26,6 +26,7 @@ loads normally with no bot check to defeat.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import urllib.error
@@ -122,6 +123,14 @@ def _reachable(text: str | None) -> tuple[bool, bool]:
     return False, False
 
 
+def _plain(markup: str | None, limit: int = 6000) -> str:
+    """Job-description HTML (Greenhouse double-escapes it) as plain text for the judge prompt."""
+    text = html.unescape(html.unescape(markup or ""))
+    text = re.sub(r"<(br|/p|/li|/h\d|/div)[^>]*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n", text)).strip()[:limit]
+
+
 def _rec(title, company, url, posted="", source="", years=None) -> dict:
     return {
         "id": url or f"{company}:{title}",
@@ -162,7 +171,9 @@ def greenhouse(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["title"], slug.title(), job.get("absolute_url", ""),
                        job.get("updated_at", ""), "Greenhouse")
-            rec.update(remote=remote, where=loc)
+            # The list endpoint has no description; fetched per job only when it's about to be judged.
+            rec.update(remote=remote, where=loc,
+                       jd_url=f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{job.get('id')}")
             out.append(rec)
     if missing:
         log(f"  (greenhouse slug not found, skipped: {', '.join(missing)})")
@@ -182,7 +193,8 @@ def ashby(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["title"], slug.title(), job.get("jobUrl", ""),
                        job.get("publishedAt", ""), "Ashby")
-            rec.update(remote=remote, where=job.get("location"))
+            rec.update(remote=remote, where=job.get("location"),
+                       desc=_plain(job.get("descriptionPlain") or job.get("descriptionHtml")))
             out.append(rec)
     return out
 
@@ -201,7 +213,9 @@ def lever(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             rec = _rec(job["text"], slug.replace("-", " ").title(), job.get("hostedUrl", ""),
                        "", "Lever")
-            rec.update(remote=remote, where=loc)
+            lists = "\n".join(f"{x.get('text', '')}:\n{_plain(x.get('content'))}" for x in job.get("lists") or [])
+            rec.update(remote=remote, where=loc,
+                       desc=_plain(f"{job.get('descriptionPlain', '')}\n{lists}\n{job.get('additionalPlain', '')}"))
             out.append(rec)
     return out
 
