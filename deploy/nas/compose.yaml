@@ -21,10 +21,17 @@ services:
       SWEEP_INTERVAL_HOURS: "6"
       MAX_PER_CYCLE: "8"               # caps cloud spend per cycle
       FIT_THRESHOLD: "70"
+      HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
     volumes:
       - ./:/app
     networks: [desk]
     command: ["sh", "-c", "pip install -q --no-cache-dir python-docx && exec python -u build/nas_agent.py"]
+    healthcheck:                       # unhealthy if the heartbeat is older than 2h (it refreshes every 30m)
+      test: ["CMD", "python", "-c", "import json,datetime as d,sys; s=json.load(open('build/.nas_state.json')); sys.exit((d.datetime.now()-d.datetime.fromisoformat(s['heartbeat'])).total_seconds()>7200)"]
+      interval: 10m
+      timeout: 20s
+      start_period: 3h                 # the first sweep can take a while before anything is written
+      retries: 2
 
 networks:
   desk:                                # the trading-desk project's default network, where trading-ollama lives

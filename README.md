@@ -75,6 +75,24 @@ Environment (put the secrets in `.env`, which is never committed):
 | `SWEEP_INTERVAL_HOURS` | `6` | Loop interval |
 | `MAX_PER_CYCLE` | `8` | Max LLM judgements per cycle |
 | `FIT_THRESHOLD` | `70` | Minimum score before drafting and alerting |
+| `HEARTBEAT_MIN` | `30` | How often the idle loop rewrites the heartbeat in the state file |
+
+### Telegram commands
+
+Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_CHAT_ID` only:
+
+| Command | What it does |
+|---|---|
+| `/status` | Heartbeat, last cycle, Ollama reachability, last 5 runs, last error. No LLM call. |
+| `/ask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
+| `/sweep` | Runs a cycle now. |
+| `/help` | Lists the commands. |
+
+Only one process may call `getUpdates` per bot token, so nothing else should poll this bot.
+
+### Health
+
+Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually because `trading-ollama` is down), you get a Telegram warning instead of silent retries.
 
 ### On a NAS (Docker)
 

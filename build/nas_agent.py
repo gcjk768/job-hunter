@@ -3,6 +3,12 @@
     python build/nas_agent.py          # loop forever (the container's entrypoint)
     python build/nas_agent.py --once   # one cycle, then exit
 
+Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for commands:
+    /status          health: last cycle, heartbeat, recent runs, errors (no LLM)
+    /ask <question>  ask the model about the jobs it has seen, the drafts, or the system
+    /sweep           run a cycle now
+    /help
+
 Reuses the sweep (weekly_sweep.collect + job_sources) and the document builder (build_docs), so the
 filters in docs/vault/Target Criteria.md and the resume content in build/content.py stay the single
 source of truth. Never applies anywhere: it drafts into tailored-auto/ and tells James.
@@ -10,8 +16,11 @@ source of truth. Never applies anywhere: it drafts into tailored-auto/ and tells
 It keeps its own state (build/.nas_state.json), separate from the PC sweep's, and writes nothing to
 the vault — the NAS copy of the vault would drift from the OneDrive one.
 
+The state file also carries a heartbeat, rewritten every HEARTBEAT_MIN minutes while idle, so an
+outside watchdog (or the compose healthcheck) can tell "alive but nothing new" from "down".
+
 Env: OLLAMA_BASE_URL, JOB_MODEL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID, SWEEP_INTERVAL_HOURS,
-     MAX_PER_CYCLE, FIT_THRESHOLD.
+     MAX_PER_CYCLE, FIT_THRESHOLD, HEARTBEAT_MIN.
 """
 from __future__ import annotations
 
@@ -41,6 +50,7 @@ INTERVAL_H = float(os.environ.get("SWEEP_INTERVAL_HOURS", "6"))
 # ponytail: caps cloud spend per cycle; the rest stay unseen and roll into the next cycle.
 MAX_PER_CYCLE = int(os.environ.get("MAX_PER_CYCLE", "8"))
 FIT_THRESHOLD = int(os.environ.get("FIT_THRESHOLD", "70"))
+HEARTBEAT_MIN = float(os.environ.get("HEARTBEAT_MIN", "30"))
 MASTER = build_docs.MASTER
 PROJECTS = [p["name"] for p in MASTER["projects"]]
 
@@ -141,16 +151,32 @@ def build(rec: dict, v: dict) -> Path:
     return outdir
 
 
-def telegram(text: str) -> None:
+def telegram(text: str, thread: str | int | None = None) -> None:
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (token and chat):
         print("[TG] not configured:\n" + text)
         return
     fields = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": "true"}
-    if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
-        fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
+    thread = thread or os.environ.get("TELEGRAM_THREAD_ID")
+    if thread:  # a forum topic, e.g. t.me/c/<chat>/<topic>
+        fields["message_thread_id"] = str(thread)
     data = urllib.parse.urlencode(fields).encode()
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
+
+
+def _now() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def load_state() -> dict:
+    return json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {"seen": {}}
+
+
+def save_state(state: dict) -> None:
+    state["heartbeat"] = _now()
+    tmp = STATE.with_suffix(".tmp")  # atomic replace: Syncthing and the healthcheck never see half a file
+    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    tmp.replace(STATE)
 
 
 def candidates() -> list[dict]:
@@ -163,31 +189,41 @@ def candidates() -> list[dict]:
 
 
 def cycle() -> None:
-    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {"seen": {}}
+    state = load_state()
     seen = state["seen"]
+    state["last_cycle_start"] = _now()
+    save_state(state)
     jobs = candidates()
     ident = lambda r: r.get("uuid") or r["id"]  # noqa: E731
     if not seen:
         # First run: everything on the boards today is old news (the PC sweep already covered it).
         for r in jobs:
             seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": None}
-        STATE.write_text(json.dumps(state, indent=1), encoding="utf-8")
+        _finish(state, {"candidates": len(jobs), "new": len(jobs), "judged": 0, "fits": 0, "failed": 0,
+                        "note": "baseline"})
         telegram(f"Job watcher online on the NAS. Baseline: {len(jobs)} current postings; "
                  f"I'll message you when something new fits (checking every {INTERVAL_H:g}h).")
         return
 
     new = [r for r in jobs if ident(r) not in seen]
     print(f"[{dt.datetime.now():%F %T}] {len(jobs)} candidates, {len(new)} new")
+    judged = fits = failed = 0
+    last_fail = ""
     for r in new[:MAX_PER_CYCLE]:
         try:
             v = judge(r)
         except Exception as exc:  # leave it unseen so the next cycle retries it
+            failed += 1
+            last_fail = f"{type(exc).__name__}: {exc}"
             print(f"  ! judge failed for {r['title']} @ {r['company']}: {exc}")
             continue
+        judged += 1
         fit = bool(v.get("suitable")) and int(v.get("score") or 0) >= FIT_THRESHOLD and v.get("letter")
-        seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": v.get("score"), "suitable": bool(fit)}
+        seen[ident(r)] = {"t": r["title"], "c": r["company"], "fit": v.get("score"), "suitable": bool(fit),
+                          "why": v.get("reason"), "url": r.get("url", ""), "at": _now()}
         print(f"  {v.get('score'):>3} {'FIT ' if fit else 'skip'} {r['title']} @ {r['company']}")
         if fit:
+            fits += 1
             folder = build(r, v)
             pay = "pay not published" if r.get("lo") is None else f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
             telegram(f"🆕 {r['title']} — {r['company'].title()}\n{pay} · fit {v['score']}/100 · "
@@ -195,7 +231,168 @@ def cycle() -> None:
                      f"Gaps: {v.get('gaps')}\n\n{r.get('url', '')}\n\n"
                      f"Resume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
                      f"Nothing was submitted — your call.")
-        STATE.write_text(json.dumps(state, indent=1), encoding="utf-8")
+        save_state(state)
+    _finish(state, {"candidates": len(jobs), "new": len(new), "judged": judged, "fits": fits,
+                    "failed": failed, "note": last_fail[:300]})
+    if failed and not judged:
+        # Every judge call failed: usually trading-ollama is down or off the network. Say so instead of
+        # silently retrying forever.
+        telegram(f"⚠️ Job watcher: all {failed} judge calls failed ({last_fail[:200]}). "
+                 f"Is trading-ollama running? Postings stay unseen and retry next cycle.")
+
+
+def _finish(state: dict, run: dict) -> None:
+    """Every cycle leaves a record, even one with nothing new, so 'quiet' is visible as 'alive'."""
+    run["at"] = _now()
+    state["last_cycle"] = run["at"]
+    state["runs"] = (state.get("runs") or [])[-29:] + [run]
+    state.pop("last_error", None)
+    save_state(state)
+
+
+def record_error(text: str) -> None:
+    try:
+        state = load_state()
+        state["last_error"] = {"at": _now(), "error": text[-1500:]}
+        save_state(state)
+    except Exception:
+        traceback.print_exc()
+
+
+# ---- Telegram commands -------------------------------------------------------------------------
+
+HELP = ("Job watcher commands:\n"
+        "/status — health, last cycle, recent runs\n"
+        "/ask <question> — ask the model about seen jobs, drafts, or the system\n"
+        "/sweep — run a cycle now\n"
+        "Nothing here ever applies anywhere.")
+ASK_PROMPT = """You are the assistant inside James's self-hosted job watcher (a Docker container on his NAS).
+Answer his question briefly and concretely, in plain text (no markdown tables), from the context below.
+If the context does not contain the answer, say so rather than guessing. Never claim anything was applied to.
+
+Today is {today}.
+
+CANDIDATE:
+{profile}
+
+SYSTEM STATUS:
+{status}
+
+RECENTLY JUDGED POSTINGS (newest last; score, verdict, title @ company, reason, url):
+{judged}
+
+RECENT DRAFTS (fit.md of each):
+{drafts}
+
+QUESTION: {question}"""
+
+
+def _age(stamp: str | None) -> str:
+    if not stamp:
+        return "never"
+    try:
+        h = (dt.datetime.now() - dt.datetime.fromisoformat(stamp)).total_seconds() / 3600
+    except ValueError:
+        return stamp
+    return f"{h * 60:.0f}m ago" if h < 1 else f"{h:.1f}h ago"
+
+
+def status_text(state: dict) -> str:
+    runs = state.get("runs") or []
+    lines = [f"Heartbeat: {_age(state.get('heartbeat'))}",
+             f"Last cycle finished: {_age(state.get('last_cycle'))} (every {INTERVAL_H:g}h)",
+             f"Model: {MODEL} via {OLLAMA} ({ollama_ok()})",
+             f"Postings tracked: {len(state.get('seen', {}))}"]
+    if state.get("last_error"):
+        e = state["last_error"]
+        lines.append(f"Last error {_age(e.get('at'))}: {e.get('error', '')[-400:]}")
+    for r in runs[-5:]:
+        lines.append(f"- {r.get('at', '?')[5:16]}: {r.get('candidates')} cand, {r.get('new')} new, "
+                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('failed')} failed"
+                     + (f" ({r['note']})" if r.get("note") else ""))
+    return "\n".join(lines)
+
+
+def ollama_ok() -> str:
+    try:
+        with urllib.request.urlopen(f"{OLLAMA}/api/version", timeout=10) as r:
+            return "reachable, v" + json.load(r).get("version", "?")
+    except Exception as exc:
+        return f"UNREACHABLE: {exc}"
+
+
+def ask(question: str) -> str:
+    state = load_state()
+    judged = [v for v in state.get("seen", {}).values() if v.get("fit") is not None][-60:]
+    judged_txt = "\n".join(f"- {v.get('fit')} {'FIT' if v.get('suitable') else 'skip'} {v['t']} @ {v['c']}"
+                            + (f" — {v['why']}" if v.get("why") else "") + (f" {v['url']}" if v.get("url") else "")
+                            for v in judged) or "(none yet)"
+    drafts = sorted(OUT.glob("*/fit.md"), key=lambda f: f.stat().st_mtime)[-8:] if OUT.exists() else []
+    drafts_txt = "\n\n".join(f.read_text(encoding="utf-8")[:800] for f in drafts) or "(none yet)"
+    prompt = ASK_PROMPT.format(today=dt.date.today(), profile=profile(), status=status_text(state),
+                               judged=judged_txt, drafts=drafts_txt, question=question)
+    resp = _post(f"{OLLAMA}/api/chat", {"model": MODEL, "stream": False, "think": False,
+                                        "messages": [{"role": "user", "content": prompt}]})
+    return (resp.get("message", {}).get("content") or "").strip() or "(the model returned nothing)"
+
+
+def poll_commands(state: dict, wait: int) -> bool:
+    """Long-poll Telegram for up to `wait` seconds and handle commands. Returns True when /sweep asked for
+    a cycle now. Only messages from TELEGRAM_CHAT_ID are answered; everyone else is ignored."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        time.sleep(wait)
+        return False
+    q = urllib.parse.urlencode({"timeout": wait, "offset": state.get("tg_offset", 0),
+                                "allowed_updates": json.dumps(["message"])})
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getUpdates?{q}",
+                                    timeout=wait + 15) as r:
+            updates = json.load(r).get("result", [])
+    except Exception as exc:  # 409 = another process is polling this bot token
+        print(f"  ! getUpdates failed: {exc}")
+        time.sleep(min(wait, 60))
+        return False
+    sweep_now = False
+    for u in updates:
+        state["tg_offset"] = u["update_id"] + 1
+        save_state(state)  # persist first, so a crash on one message never replays it forever
+        msg = u.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        if str(msg.get("chat", {}).get("id")) != str(chat) or not text.startswith("/"):
+            continue
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.split("@")[0].lower()  # /ask@JobHunterBot in groups
+        thread = msg.get("message_thread_id")
+        try:
+            if cmd in ("/help", "/start"):
+                telegram(HELP, thread)
+            elif cmd == "/status":
+                telegram("🟢 " + status_text(load_state()), thread)
+            elif cmd == "/ask":
+                if not arg.strip():
+                    telegram("Usage: /ask <question>, e.g. /ask which of this week's roles fit best?", thread)
+                else:
+                    telegram("🤔 " + ask(arg.strip()), thread)
+            elif cmd == "/sweep":
+                telegram("Running a sweep now…", thread)
+                sweep_now = True
+        except Exception as exc:
+            telegram(f"⚠️ {cmd} failed: {type(exc).__name__}: {exc}", thread)
+    return sweep_now
+
+
+def idle(seconds: float) -> None:
+    """Wait for the next cycle while answering commands and refreshing the heartbeat."""
+    end = time.time() + seconds
+    beat = 0.0
+    while (left := end - time.time()) > 0:
+        state = load_state()
+        if time.time() - beat >= HEARTBEAT_MIN * 60:
+            save_state(state)
+            beat = time.time()
+        if poll_commands(state, int(min(50, max(1, left)))):
+            return
 
 
 def main() -> None:
@@ -205,13 +402,14 @@ def main() -> None:
             cycle()
         except Exception:
             traceback.print_exc()
+            record_error(traceback.format_exc())
             try:
-                telegram("⚠️ Job watcher cycle failed — see `docker logs job-hunter`.")
+                telegram("⚠️ Job watcher cycle failed — see `docker logs job-hunter` or send /status.")
             except Exception:
                 pass
         if once:
             return
-        time.sleep(INTERVAL_H * 3600)
+        idle(INTERVAL_H * 3600)
 
 
 if __name__ == "__main__":
