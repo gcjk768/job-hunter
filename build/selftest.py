@@ -88,7 +88,7 @@ def nas_watcher() -> str:
         return f"repost/skip-list leaked into judging: {judged}"
     if state["seen"]["3"].get("dup_of") != "1" or not state["seen"]["amazon.jobs/10525204"].get("skip"):
         return "repost or skip not recorded"
-    if sum("Tier-1" in m for m in sent) != 1:
+    if sum("TIER-1 FIT" in m for m in sent) != 1:
         return f"expected exactly one tier-1 alert, got {len(sent)} messages"
     notes = sorted(p.name for p in (a.VAULT / "Jobs").iterdir())
     if len(notes) != 2 or not all(n.startswith(today) for n in notes):
@@ -99,7 +99,7 @@ def nas_watcher() -> str:
     if sum("failed in a row" in m for m in sent) != 1:
         return "no single failure alert after repeated judge errors"
     msgs = a.digest(state)
-    if not isinstance(msgs, list) or sum(m.startswith("✅") for m in msgs) != 2 or any(m.count("Open posting") > 1 for m in msgs):
+    if not isinstance(msgs, list) or sum(m.startswith("💼") for m in msgs) != 2 or any(m.count("Open posting") > 1 for m in msgs):
         return f"digest should send one message per fit job, got {len(msgs)} messages"
     if not (a.VAULT / "Daily" / f"{today}.md").exists():
         return "daily digest note missing"
@@ -155,6 +155,59 @@ def nas_watcher() -> str:
 
 
 CASES.append(("NAS watcher: baseline, reposts, skip list, alerts, vault", lambda: nas_watcher() == "", True))
+
+
+def telegram_html() -> str:
+    """Telegram HTML: dynamic text escaped, parts split between blocks, plain-text resend on a parse error."""
+    import io
+    import re
+    import importlib
+    import urllib.error
+
+    import nas_agent as a
+    a = importlib.reload(a)  # the watcher check above stubs a.telegram
+    e = {"t": "R&D <SRE>, R&D <SRE>", "c": "A&B Pte. Ltd.", "fit": 88, "tier1": True, "pay": "$9,000–14,000/mo",
+         "why": "<script>alert(1)</script> & more", "gaps": "none", "url": "https://x.io/?a=1&b=<2>",
+         "dir": "20261001_a&b", "ctx": "Commute: remote\nGlassdoor (researched): wlb <4>"}
+    c = a.card(e)
+    if "<SRE>" in c or "<script>" in c or "R&amp;D &lt;SRE&gt;" not in c or "a=1&amp;b=&lt;2&gt;" not in c\
+            or c.count("R&amp;D") != 1 or "wlb &lt;4&gt;" not in c:
+        return "dynamic text not escaped in card"
+    if "Open posting (https://x.io/?a=1&b=<2>)" not in a.plain(c):
+        return "plain() lost the link target"
+    tags = ("b", "i", "a", "code", "blockquote")
+    parts = a.chunks("\n\n".join([c] * 60))
+    if len(parts) < 2 or max(map(len, parts)) > 3900:
+        return "long card list not split"
+    for p in parts:
+        if any(len(re.findall(f"<{t}[ >]", p)) != p.count(f"</{t}>") for t in tags):
+            return "chunk split inside a tag"
+    calls = []
+
+    def urlopen(url, data, timeout):
+        f = dict(urllib.parse.parse_qsl(data.decode()))
+        calls.append(f)
+        if "parse_mode" in f:
+            raise urllib.error.HTTPError(url, 400, "Bad Request", {}, io.BytesIO(
+                b'{"ok":false,"description":"Bad Request: can\'t parse entities: unclosed tag"}'))
+
+    real, env = a.urllib.request.urlopen, dict(os.environ)
+    a.urllib.request.urlopen = urlopen
+    os.environ.update(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="1", TELEGRAM_THREAD_ID="2574")
+    try:
+        a.telegram(c)
+    finally:
+        a.urllib.request.urlopen = real
+        os.environ.clear()
+        os.environ.update(env)
+    if len(calls) != 2 or calls[0]["parse_mode"] != "HTML" or calls[0]["disable_web_page_preview"] != "true"\
+            or "parse_mode" in calls[1] or "<b>" in calls[1]["text"] or "R&D <SRE>" not in calls[1]["text"]\
+            or calls[1]["message_thread_id"] != "2574":
+        return f"no plain-text resend after a parse error: {calls}"
+    return ""
+
+
+CASES.append(("Telegram HTML: escaping, block-safe chunks, plain fallback", lambda: telegram_html() == "", True))
 
 
 def main() -> int:

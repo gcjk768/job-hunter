@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -199,46 +200,103 @@ def build(rec: dict, v: dict) -> Path:
     return outdir
 
 
-def telegram(text: str, rich: bool = False) -> None:
-    """rich=True sends Telegram HTML: every interpolated value must then go through html.escape."""
+def telegram(text: str) -> None:
+    """Send Telegram HTML (the one send path). Every dynamic value must already be html.escape'd by the
+    caller. Long text goes out in parts split between blocks; if Telegram rejects a part's HTML (400
+    "can't parse entities") that part is resent as plain text, so an alert is never lost."""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (token and chat):
         print("[TG] not configured:\n" + text)
         return
-    parts = chunks(text)  # Telegram caps a message at 4096 chars; long digests go out in parts
-    for part in parts:
-        fields = {"chat_id": chat, "text": part, "disable_web_page_preview": "true"}
-        if rich:
-            fields["parse_mode"] = "HTML"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for part in chunks(text):
+        fields = {"chat_id": chat, "text": part, "parse_mode": "HTML", "disable_web_page_preview": "true"}
         if os.environ.get("TELEGRAM_THREAD_ID"):  # a forum topic, e.g. t.me/c/<chat>/<topic>
             fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
-        data = urllib.parse.urlencode(fields).encode()
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
+        try:
+            urllib.request.urlopen(url, data=urllib.parse.urlencode(fields).encode(), timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 400 or "can't parse entities" not in exc.read().decode("utf-8", "replace"):
+                raise
+            del fields["parse_mode"]
+            fields["text"] = plain(part)
+            urllib.request.urlopen(url, data=urllib.parse.urlencode(fields).encode(), timeout=30)
 
 
-def label(e: dict) -> str:
-    """"Title — Employer" for a phone screen: repeated title segments ("AWS SGP, AWS SGP") and the
+def plain(text: str) -> str:
+    """Telegram HTML to plain text, keeping link targets: for the parse-error fallback and the vault notes."""
+    text = re.sub(r'<a href="([^"]*)">(.*?)</a>', r"\2 (\1)", text)
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+# One fixed emoji + title per message type (James's Telegram card style); head() adds the subtitle.
+SECTION_TITLES = {
+    "online": ("🟢", "JOB WATCHER"),
+    "failing": ("⚠️", "JOB WATCHER"),
+    "tier1": ("⭐", "TIER-1 FIT"),
+    "digest": ("📋", "JOB DIGEST"),
+    "notfit": ("🚫", "NOT A FIT"),
+    "rescored": ("🔁", "RE-SCORED"),
+    "weekly": ("🗓", "WEEKLY"),
+}
+DIVIDER = "━━━━━━━━━━━━━━━━"
+
+
+def head(kind: str, subtitle: str) -> str:
+    emoji, title = SECTION_TITLES[kind]
+    return f"{emoji} <b>{title}</b> · {html.escape(subtitle)}"
+
+
+def names(e: dict) -> tuple[str, str]:
+    """(title, employer) for a phone screen: repeated title segments ("AWS SGP, AWS SGP") and the
     employer's legal suffix ("Pte. Ltd.", "Singapore Private Limited") dropped."""
     title = ", ".join(dict.fromkeys(p.strip() for p in e["t"].split(",")))
     co = re.sub(r"(?:[\s,]+(?:singapore|pte\.?|ltd\.?|private|limited))+\s*$", "", e["c"].title(), flags=re.I)
-    return f"{title} — {co or e['c'].title()}"
+    return title, co or e["c"].title()
 
 
-def card(e: dict, head: str = "") -> str:
-    """One fit as Telegram HTML (one line per tag, so chunks() never splits a tag): bold title, one
-    facts line, why/gaps, and a tappable link instead of a raw URL that wraps over four lines."""
+def label(e: dict) -> str:
+    """"Title — Employer"."""
+    return " — ".join(names(e))
+
+
+def card(e: dict, extra: list[str] = ()) -> str:
+    """One job as a Telegram HTML block (no blank lines inside, so chunks() never splits it): title and
+    employer, fit + pay, commute, why/gaps, a tappable link, then any `extra` (already-HTML) lines;
+    the researched company context goes last in an expandable quote."""
     esc = html.escape
-    lines = [f"{head or ('✅ ⭐' if e.get('tier1') else '✅')} <b>{esc(label(e))}</b>",
-             f"fit {e['fit']} · {esc(e['pay'])}",
-             f"<b>Why:</b> {esc(e.get('why') or '')}", f"<b>Gaps:</b> {esc(e.get('gaps') or '')}"]
-    lines += [f"<i>{esc(c)}</i>" for c in (e.get("ctx") or "").split("\n") if c]
-    lines.append(f'<a href="{esc(e.get("url") or "")}">Open posting</a>'
-                 + (f" · docs <code>{esc(e['dir'])}</code>" if e.get("dir") else ""))
+    title, co = names(e)
+    ctx = [c for c in (e.get("ctx") or "").split("\n") if c]
+    lines = [f"💼 <b>{esc(title)}</b> · {esc(co)}",
+             f"🎯 fit <b>{esc(str(e['fit']))}</b>" + (" · ⭐ tier-1" if e.get("tier1") else "")
+             + f"  ·  💰 {esc(e['pay'])}"]
+    lines += [f"📍 {esc(c)}" for c in ctx if c.startswith("Commute:")]
+    lines += [f"✅ <b>Why:</b> {esc(e.get('why') or '')}", f"⚠️ <b>Gaps:</b> {esc(e.get('gaps') or '')}"]
+    links = [f'<a href="{esc(e["url"])}">Open posting</a>'] if e.get("url") else []
+    links += [f"📁 <code>{esc(e['dir'])}</code>"] if e.get("dir") else []
+    if links:
+        lines.append("🔗 " + "  ·  ".join(links))
+    lines += list(extra)
+    more = [esc(c) for c in ctx if not c.startswith("Commute:")]
+    if more:
+        lines.append("<blockquote expandable>🏢 <b>Company</b>\n" + "\n".join(more) + "</blockquote>")
     return "\n".join(lines)
 
 
 def chunks(text: str, limit: int = 3900) -> list[str]:
-    """Split on line boundaries so no entry is cut mid-way; a single over-long line is hard-cut."""
+    """Split between blocks (blank lines) so no tag is ever cut. A block over the limit falls back to
+    line boundaries, and a single over-long line to a hard cut.
+    ponytail: those two fallbacks can cut a multi-line tag; telegram() then resends that part as plain text."""
+    out, cur = [], ""
+    for block in text.split("\n\n"):
+        for piece in ([block] if len(block) <= limit else _by_line(block, limit)):
+            if cur and len(cur) + 2 + len(piece) > limit:
+                out, cur = out + [cur], ""
+            cur = f"{cur}\n\n{piece}" if cur else piece
+    return out + ([cur] if cur else [])
+
+
+def _by_line(text: str, limit: int) -> list[str]:
     out, cur = [], ""
     for line in text.split("\n"):
         while len(line) > limit:
@@ -466,9 +524,11 @@ def cycle(state: dict) -> None:
         # First run: older postings count as already seen so it does not flood; the last few days are
         # still judged (a blanket baseline once hid everything since the previous PC sweep).
         recent = baseline(state, jobs)
-        telegram(f"Job watcher online on the NAS. Baseline: {len(jobs) - recent} older postings skipped, "
-                 f"{recent} from the last {BASELINE_DAYS} days queued for judging; sweeping every "
-                 f"{INTERVAL_H:g}h, digest daily at {DIGEST_HOUR}:00, tier-1 employers straight away.")
+        telegram(f"{head('online', 'on the NAS')}\n\n"
+                 f"🗂 <b>Baseline</b> · first run\n⏭ {len(jobs) - recent} older postings skipped\n"
+                 f"🆕 {recent} from the last {BASELINE_DAYS} days queued for judging\n\n"
+                 f"<i>Sweeping every {INTERVAL_H:g}h · digest daily at {DIGEST_HOUR}:00 · "
+                 f"tier-1 employers straight away</i>")
 
     skips = skip_patterns()
     known = {dupe_key(e["t"], e["c"]): i for i, e in seen.items()}
@@ -496,9 +556,10 @@ def cycle(state: dict) -> None:
             state["fail_streak"] = state.get("fail_streak", 0) + 1
             if state["fail_streak"] >= FAIL_ALERT and state.get("fail_alert_on") != str(dt.date.today()):
                 state["fail_alert_on"] = str(dt.date.today())
-                telegram(f"⚠️ Job watcher: {state['fail_streak']} judge calls failed in a row, so new postings "
-                         f"(tier-1 included) are not being scored. Last error: {log['error']}\n"
-                         f"If it says login/auth: Docker → job-hunter → Terminal → `claude` → /login.")
+                telegram(f"{head('failing', 'judge calls failing')}\n\n"
+                         f"🔴 <b>{state['fail_streak']} failed in a row</b> · new postings (tier-1 included) "
+                         f"are not being scored\n🧾 Last error: <code>{html.escape(log['error'])}</code>\n\n"
+                         f"<i>If it says login/auth: Docker → job-hunter → Terminal → <code>claude</code> → /login</i>")
             save(state)
             continue
         state["fail_streak"] = 0
@@ -514,10 +575,11 @@ def cycle(state: dict) -> None:
         print(f"  {v.get('score'):>3} {'FIT ' if fit else 'skip'}{' T1' if tier1 else ''} "
               f"{r['title']} @ {r['company']}")
         if tier1 and suitable:
-            telegram(card(seen[ident(r)], "⭐ Tier-1:")
-                     + f"\ncoding-test risk {html.escape(str(v.get('coding_test_risk', '?')))}"
-                     + ("" if folder else f"\nBelow the {FIT_THRESHOLD} fit bar, so no documents drafted.")
-                     + "\nNothing was submitted — your call.", rich=True)
+            extra = [f"🧪 Coding-test risk: {html.escape(str(v.get('coding_test_risk', '?')))}"]
+            if not folder:
+                extra.append(f"<i>Below the {FIT_THRESHOLD} fit bar, so no documents drafted.</i>")
+            telegram(f"{head('tier1', 'sent at once')}\n\n{card(seen[ident(r)], extra)}\n\n"
+                     "<i>Nothing was submitted — your call.</i>")
         save(state)
 
 
@@ -531,22 +593,24 @@ def digest(state: dict) -> list[str]:
     shown: set[str] = set()  # a role judged twice before dedupe existed is listed once, best score
     judged = [e for e in judged if not (dupe_key(e["t"], e["c"]) in shown or shown.add(dupe_key(e["t"], e["c"])))]
     fits =[e for e in judged if e.get("suitable")]
-    lines = [f"📋 <b>Job digest {day}</b>\n{len(fits)} fit of {len(judged)} new · "
-             f"{log['candidates']} on the boards · {log['sweeps']} sweeps"]
+    lines = [head("digest", day), "",
+             f"📊 <b>{len(fits)} fit</b> of {len(judged)} new",
+             f"🔎 {log['candidates']} on the boards · {log['sweeps']} sweeps"]
     if log["error"]:
-        lines.append(f"⚠️ {log['failed']} judge failures (retried next sweep). "
-                     f"Last error: {html.escape(str(log['error']))}")
+        lines.append(f"⚠️ {log['failed']} judge failures (retried next sweep)")
     if not judged:
-        lines.append("Nothing new today.")
+        lines.append("😴 Nothing new today.")
+    if log["error"]:
+        lines += ["", DIVIDER, f"<blockquote expandable>🧾 <b>Last error</b>\n{html.escape(str(log['error']))}</blockquote>"]
     msgs = ["\n".join(lines)] + [card(e) for e in fits]
     rest = [e for e in judged if not e.get("suitable")]
     if rest:
-        msgs.append("\n".join(["<b>Not a fit</b>"] + [f"{e.get('fit')} · {html.escape(label(e))}" for e in rest]))
+        msgs.append("\n".join([head("notfit", f"{len(rest)} today"), ""]
+                              + [f"{html.escape(str(e.get('fit')))} · {html.escape(label(e))}" for e in rest]))
     text = "\n\n".join(msgs)
-    plain = html.unescape(re.sub(r"<[^>]+>", "", text))  # the vault note is Markdown, not Telegram HTML
-    daily = VAULT / "Daily" / f"{day}.md"
+    daily = VAULT / "Daily" / f"{day}.md"  # the vault note is Markdown, not Telegram HTML
     daily.parent.mkdir(parents=True, exist_ok=True)
-    daily.write_text(f"---\ntags: [digest]\ndate: {day}\n---\n\n{plain}\n\n## Notes\n"
+    daily.write_text(f"---\ntags: [digest]\ndate: {day}\n---\n\n{plain(text)}\n\n## Notes\n"
                      + "".join(f"- [[{e['note']}]]\n" for e in judged if e.get("note")), encoding="utf-8")
     return msgs
 
@@ -583,11 +647,18 @@ def rejudge(state: dict, n: int) -> None:
         save(state)
     changed.sort(key=lambda pe: -(pe[1].get("fit") or 0))
     fits = [(pid, e) for pid, e in changed if e.get("suitable")]
-    telegram(f"🔁 <b>Re-scored top {len(changed)}</b> with full job descriptions: {len(fits)} fit\n"
-             + "\n".join(f"{e['fit']}" + (f" <i>(was {e['was']})</i>" if e.get("was") not in (None, e["fit"]) else "")
-                         + f" · {html.escape(label(e))}" for _, e in changed), rich=True)
+    telegram("\n".join([head("rescored", f"top {len(changed)} with full job descriptions"), "",
+                        f"📊 <b>{len(fits)} fit</b> of {len(changed)}", ""] + [moved(e) for _, e in changed]))
     for _, e in fits:
-        telegram(card(e), rich=True)
+        telegram(card(e))
+
+
+def moved(e: dict) -> str:
+    """One re-scored line: 🟢 up / 🔴 down / ⚪ same, with ▲/▼ and the old score."""
+    d = int(e["fit"] or 0) - int(e["was"]) if e.get("was") is not None else 0
+    mark = "🟢" if d > 0 else "🔴" if d < 0 else "⚪"
+    tag = f" <i>{'▲' if d > 0 else '▼'}{abs(d)} (was {e['was']})</i>" if d else ""
+    return f"{mark} {html.escape(str(e['fit']))}{tag} · {html.escape(label(e))}"
 
 
 def weekly(state: dict) -> str:
@@ -601,18 +672,20 @@ def weekly(state: dict) -> str:
         employers[e["c"].title()] = employers.get(e["c"].title(), 0) + 1
     top = sorted(employers.items(), key=lambda kv: -kv[1])[:8]
     closed = sum(1 for e in week if e.get("closed") and not e.get("status"))
-    lines = [f"🗓 Week to {today} — {len(week)} new postings judged, {len(fits)} fit, {closed} already off the boards."]
+    esc = html.escape
+    lines = [head("weekly", f"week to {today}"), "",
+             f"📊 {len(week)} new postings judged · <b>{len(fits)} fit</b> · {closed} already off the boards"]
     if fits:
-        lines.append("\nFits this week:")
-        lines += [f"· {e['fit']} {label(e)} [{e.get('status') or ('closed' if e.get('closed') else 'open')}]"
-                  for e in fits]
+        lines += ["", DIVIDER, "⭐ <b>Fits this week</b>"]
+        lines += [f"{'❌' if e.get('closed') and not e.get('status') else '💼'} {esc(str(e['fit']))} · {esc(label(e))}"
+                  f" · <i>{esc(e.get('status') or ('closed' if e.get('closed') else 'open'))}</i>" for e in fits]
     if top:
-        lines.append("\nMost active employers: " + ", ".join(f"{c} ({n})" for c, n in top))
+        lines += ["", DIVIDER, "🏢 <b>Most active employers</b>", esc(", ".join(f"{c} ({n})" for c, n in top))]
     text = "\n".join(lines)
     iso = today.isocalendar()
     path = VAULT / "Weekly" / f"{iso.year}-W{iso.week:02d}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"---\ntags: [digest]\ndate: {today}\n---\n\n{text}\n", encoding="utf-8")
+    path.write_text(f"---\ntags: [digest]\ndate: {today}\n---\n\n{plain(text)}\n", encoding="utf-8")
     return text
 
 
@@ -632,7 +705,7 @@ def write_status(state: dict) -> None:
 def main() -> None:
     if "--digest" in sys.argv:
         for m in digest(load()):
-            telegram(m, rich=True)
+            telegram(m)
         return
     once = "--once" in sys.argv
     code = lambda: {f: f.stat().st_mtime for f in Path(__file__).parent.glob("*.py")}  # noqa: E731
@@ -665,7 +738,7 @@ def main() -> None:
         if dt.datetime.now().hour >= DIGEST_HOUR and state.get("digest_on") != today:
             try:
                 for m in digest(state):
-                    telegram(m, rich=True)
+                    telegram(m)
                 if dt.date.today().weekday() == 6:  # Sunday
                     telegram(weekly(state))
                 state["digest_on"] = today
