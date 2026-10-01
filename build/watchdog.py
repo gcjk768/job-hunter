@@ -20,9 +20,10 @@ import json
 import os
 import sys
 import tempfile
-import urllib.parse
-import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tg import esc, head, telegram  # noqa: E402  (the watcher's one send path, stdlib only)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -68,18 +69,6 @@ def problem(state_path: Path, max_h: float, interval_h: float) -> str | None:
     return None
 
 
-def telegram(text: str) -> None:
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not (token and chat):
-        print("[TG] not configured:\n" + text)
-        return
-    fields = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": "true"}
-    if os.environ.get("TELEGRAM_THREAD_ID"):
-        fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage",
-                           data=urllib.parse.urlencode(fields).encode(), timeout=30)
-
-
 def main() -> int:
     load_env()
     state_path = Path(os.environ.get("JOB_STATE", ROOT / "build" / ".nas_state.json"))
@@ -88,10 +77,10 @@ def main() -> int:
     issue = problem(state_path, float(os.environ.get("WATCHDOG_MAX_H", "2")),
                     float(os.environ.get("SWEEP_INTERVAL_HOURS", "6")))
     if issue and not marker.exists():
-        telegram(f"🔴 Job watcher looks down: {issue}")
+        telegram(head("down", "from the PC watchdog") + "\n\n🔴 " + esc(issue))
         marker.write_text(issue, encoding="utf-8")
     elif not issue and marker.exists():
-        telegram("🟢 Job watcher is reporting again.")
+        telegram(head("back", "from the PC watchdog") + "\n\n🟢 Job watcher is reporting again.")
         marker.unlink()
     print(issue or "ok")
     return 1 if issue else 0

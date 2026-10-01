@@ -217,9 +217,9 @@ SENT.clear()
 a.candidates = lambda: [rec("j10")]
 a.cycle()
 alert = next((s for s in SENT if "SRE j10" in s), "")
-check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 APPLY TODAY" in alert)
+check("score >= URGENT_SCORE is flagged 'apply today'", "🔥 <b>APPLY TODAY</b>" in alert)
 check("alert carries who to reach, a people-search link and the note",
-      "Reach out to: Head of Platform" in alert and "linkedin.com/search/results/people" in alert
+      "Reach out to:</b> Head of Platform" in alert and "linkedin.com/search/results/people" in alert
       and "Checked note." in alert)
 ref10 = a.load_state()["seen"]["j10"]["ref"]
 check("fits get a ref number in the alert", f"/applied {ref10}" in alert)
@@ -277,7 +277,7 @@ check("/applied records status and date", e10["status"] == "interview" and e10.g
 check("/applied with free text tracks a manual entry",
       any(e.get("source") == "manual" and e["c"] == "Initech" for e in st["seen"].values()))
 check("/pipeline lists tracked applications", any("Initech" in s and f"#{ref10}" in s for s in SENT))
-check("/interview replies with a prep pack", any("📚 LIKELY QUESTIONS" in s for s in SENT))
+check("/interview replies with a prep pack", any("📚 <b>PREP PACK</b>" in s and "LIKELY QUESTIONS" in s for s in SENT))
 check("history keeps every status change", [h[0] for h in e10["history"]] == ["drafted", "applied", "interview"])
 
 st["seen"]["old-tracked"] = {"t": "x", "c": "y", "at": "2000-01-01T00:00:00", "ref": 999}
@@ -300,7 +300,7 @@ SENT.clear()
 sunday10 = monday10 + dt.timedelta(days=6)
 a.chores(sunday10)
 a.chores(sunday10)
-check("the weekly digest is sent once per week", sum("Weekly job-hunt digest" in s for s in SENT) == 1)
+check("the weekly digest is sent once per week", sum("<b>WEEKLY DIGEST</b>" in s for s in SENT) == 1)
 check("the digest reports the reply rate", any("reply rate" in s for s in SENT))
 SENT.clear()
 a.chores(sunday10 + dt.timedelta(days=1, hours=-3))
@@ -452,22 +452,22 @@ a.mail_alerts.fetch = lambda done: real_fetch(done, imap_factory=FakeIMAP)
 SENT.clear()
 UPDATES[:] = [msg(40, "/selfcheck")]
 a.poll_commands(a.load_state(), 1)
-report = next((s for s in SENT if "🩺 Self-check" in s), "")
+report = next((s for s in SENT if "🩺 <b>SELF-CHECK</b>" in s), "")
 check("/selfcheck reports Claude, MCF and each board",
-      "✅ Claude" in report and "✅ MyCareersFuture: 2 results" in report
-      and "✅ Greenhouse" in report and "description 17 chars" in report and "✅ Ashby" in report)
-check("/selfcheck marks an empty board as reachable, not failed", "⚪ Lever" in report and "no open roles" in report)
-check("/selfcheck logs in to the mailbox", "✅ Alert emails: logged in, 1 alert email(s)" in report)
-check("/selfcheck warns when the example resume/profile are loaded", "❌ Private files" in report
+      "✅ <b>Claude</b>" in report and "✅ <b>MyCareersFuture</b> · 2 results" in report
+      and "✅ <b>Greenhouse" in report and "description 17 chars" in report and "✅ <b>Ashby" in report)
+check("/selfcheck marks an empty board as reachable, not failed", "⚪ <b>Lever" in report and "no open roles" in report)
+check("/selfcheck logs in to the mailbox", "✅ <b>Alert emails</b> · logged in, 1 alert email(s)" in report)
+check("/selfcheck warns when the example resume/profile are loaded", "❌ <b>Private files</b>" in report
       and "EXAMPLE resume" in report)
-check("/selfcheck checks storage and counts problems", "✅ Storage: writable" in report and "problem(s) above" in report)
+check("/selfcheck checks storage and counts problems", "✅ <b>Storage</b> · writable" in report and "problem(s) above" in report)
 real_urlopen = a.urllib.request.urlopen
 a.urllib.request.urlopen = lambda req, *x, **k: fake_urlopen(req, *x, **k) if "telegram" in str(
     getattr(req, "full_url", req)) else (_ for _ in ()).throw(OSError("network down"))
 report = a.selfcheck()
 a.urllib.request.urlopen = real_urlopen
 check("one failing dependency never hides the others",
-      report.count("❌") >= 5 and "✅ Claude" in report and "network down" in report)
+      report.count("❌") >= 5 and "✅ <b>Claude</b>" in report and "network down" in report)
 sys.argv = ["nas_agent.py", "--selfcheck"]
 try:
     a.main()
@@ -617,7 +617,7 @@ CALLS.clear()
 HEAL_REPLY.update(actions=["clear_retry_counters", "wait_and_retry", "pause_mail_24h"],
                   patch="--- a/build/x.py\n+++ b/build/x.py\n@@ -1 +1 @@\n-a\n+b")
 err = 'Traceback (most recent call last):\n  File "/app/build/nas_agent.py", line 30, in cycle\nTimeoutError: timed out'
-check("heal() reports a diagnosis", a.heal("sweep raised", err) and any("🩹 Self-heal: sweep raised" in s
+check("heal() reports a diagnosis", a.heal("sweep raised", err) and any("🩹 <b>SELF-HEAL</b> · sweep raised" in s
                                                                      and "board API timed out" in s for s in SENT))
 st = a.load_state()
 check("heal() applies the chosen safe remedies", st["attempts"] == {} and a.backoff_left(st) > 3000
@@ -672,7 +672,7 @@ HEAL_REPLY.update(actions=["none"])
 SENT.clear()
 UPDATES[:] = [msg(800, "/heal")]
 a.poll_commands(a.load_state(), 1)
-check("/heal diagnoses the last recorded error", any("🩹 Self-heal: manual /heal" in s for s in SENT))
+check("/heal diagnoses the last recorded error", any("🩹 <b>SELF-HEAL</b> · manual /heal" in s for s in SENT))
 real_tg = a.telegram
 a.telegram = lambda *x, **k: (_ for _ in ()).throw(OSError("telegram down"))
 try:
@@ -694,6 +694,72 @@ check("watchdog: stale heartbeat", "3.0h ago" in (watchdog.problem(wd_state, 2, 
 wd_state.write_text(json.dumps({"heartbeat": fresh, "last_cycle": "2000-01-01T00:00:00"}))
 check("watchdog: alive but sweeps stuck", "last finished sweep" in (watchdog.problem(wd_state, 2, 6) or ""))
 check("watchdog: missing file", "not found" in (watchdog.problem(TMP / "nope.json", 2, 6) or ""))
+
+# --- Telegram HTML: escaping, block-safe chunks, plain-text fallback --------------------------------
+import re  # noqa: E402
+import urllib.error  # noqa: E402
+
+import tg  # noqa: E402
+
+check("every message goes out as HTML with link previews off",
+      SENT and all("parse_mode=HTML" in s and "disable_web_page_preview=true" in s for s in SENT))
+check("the watchdog uses the same send path", watchdog.telegram is tg.telegram is a.telegram)
+hostile = {"id": "h1", "title": "R&D <SRE>", "company": "A&B <Asia>", "source": "email:linkedin",
+           "url": "https://x.io/job?a=1&b=<2>", "lo": 9000, "hi": 12000}
+bad_v = dict(VERDICT, score=90, reason="<script>alert(1)</script> & co", gaps="none <yet>",
+             outreach="Hi <b>there</b> & thanks", contact_titles=["Head of <Infra>"], factcheck=[])
+card = a.alert_text(hostile, bad_v, TMP / "R&D_<x>", 7)
+check("dynamic text in an alert is escaped (title, employer, LLM text, URL, folder)",
+      "<SRE>" not in card and "<script>" not in card and "<Asia>" not in card and "<b>there</b>" not in card
+      and "R&amp;D &lt;SRE&gt;" in card and "&lt;script&gt;" in card and "a=1&amp;b=&lt;2&gt;" in card
+      and "R&amp;D_&lt;x&gt;" in card)
+check("plain() unescapes and keeps link targets", "Open posting (https://x.io/job?a=1&b=<2>)" in tg.plain(card)
+      and "R&D <SRE>" in tg.plain(card))
+TAGS = ("b", "i", "a", "code", "blockquote")
+parts = tg.chunks("\n\n".join([card] * 40))
+check("long text splits into parts under the limit",
+      len(parts) > 1 and max(map(len, parts)) <= tg.LIMIT and sum(p.count("APPLY TODAY") for p in parts) == 40)
+check("chunks never split inside a tag",
+      all(len(re.findall(f"<{t}[ >]", p)) == p.count(f"</{t}>") for p in parts for t in TAGS))
+check("a quote never contains a blank line, so it stays one block",
+      "\n\n" not in tg.quote("x", "a\n\n\nb") and tg.chunks(tg.quote("x", "a\n\nb")) == [tg.quote("x", "a\nb")])
+TRIED: list[dict] = []
+
+
+def rejecting_urlopen(url, data=None, timeout=0):
+    f = dict(urllib.parse.parse_qsl(data.decode()))
+    TRIED.append(f)
+    if "parse_mode" in f:
+        raise urllib.error.HTTPError(url, 400, "Bad Request", {}, io.BytesIO(
+            b'{"ok":false,"error_code":400,"description":"Bad Request: can\'t parse entities: unclosed tag"}'))
+    return Resp(b"{}")
+
+
+a.urllib.request.urlopen = rejecting_urlopen
+tg.telegram(card, 2574)
+check("rejected HTML is resent as plain text in the same topic",
+      len(TRIED) == 2 and TRIED[0]["parse_mode"] == "HTML" and "parse_mode" not in TRIED[1]
+      and "<b>APPLY" not in TRIED[1]["text"] and "R&D <SRE>" in TRIED[1]["text"] and TRIED[1]["message_thread_id"] == "2574")
+a.urllib.request.urlopen = lambda url, data=None, timeout=0: (_ for _ in ()).throw(
+    urllib.error.HTTPError(url, 403, "Forbidden", {}, io.BytesIO(b"{}")))
+try:
+    tg.telegram("x")
+    check("other Telegram errors still raise", False)
+except urllib.error.HTTPError:
+    check("other Telegram errors still raise", True)
+a.urllib.request.urlopen = fake_urlopen
+SENT.clear()
+a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, json.dumps(
+    {"subtype": "success", "is_error": False, "result": "Use <kubectl> & helm"}), "")
+UPDATES[:] = [msg(900, "/ask what <tools>?")]
+a.poll_commands(a.load_state(), 1)
+a.subprocess.run = fake_run
+check("/ask escapes the model's answer and the question",
+      any("Use &lt;kubectl&gt; &amp; helm" in s and "what &lt;tools&gt;?" in s for s in SENT))
+a.urllib.request.urlopen = lambda req, *x, **k: Resp(json.dumps(
+    {"jobPostingInfo": {"jobDescription": "<p>Run &amp; scale K8s</p>"}}).encode())
+check("Workday postings fetch their description", a.description({"jd_workday": "https://w/job"}) == "Run & scale K8s")
+a.urllib.request.urlopen = fake_urlopen
 
 failed = [label for label, ok in CHECKS if not ok]
 for label, ok in CHECKS:

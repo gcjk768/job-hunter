@@ -20,6 +20,7 @@
 !/build/test_nas_agent.py
 !/build/watchdog.py
 !/build/mail_alerts.py
+!/build/tg.py
 
 /deploy/*
 !/deploy/nas/

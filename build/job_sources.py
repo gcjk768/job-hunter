@@ -245,6 +245,8 @@ def amazon(keep: re.Pattern, log=print) -> list[dict]:
                 continue
             url = "https://www.amazon.jobs" + (job.get("job_path") or "")
             rec = _rec(job["title"], "Amazon / AWS", url, job.get("posted_date", ""), "amazon.jobs")
+            rec["desc"] = _plain("\n".join(job.get(k) or "" for k in
+                                             ("description", "basic_qualifications", "preferred_qualifications")))
             if rec["id"] not in {o["id"] for o in out}:
                 out.append(rec)
     return out
@@ -281,6 +283,8 @@ def workday(keep: re.Pattern, log=print) -> list[dict]:
                     link = f"https://{host}.{wd}.myworkdayjobs.com/en-US/{site}{path}"
                     rec = _rec(job["title"], host.title(), link,
                                job.get("postedOn", ""), "Workday")
+                    # Workday's list call has no description; nas_agent.description() fetches this.
+                    rec["jd_workday"] = f"https://{host}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{path}"
                     if rec["id"] not in {o["id"] for o in out}:
                         out.append(rec)
     return out
@@ -320,7 +324,8 @@ def nvidia(keep: re.Pattern, log=print) -> list[dict]:
             rec = _rec(title, "NVIDIA", link, "", "NVIDIA (Workday)")
             # postedOn is relative text ("Posted 23 Days Ago"), not a date — keep it as the note
             # rather than pretending it parses.
-            rec.update(where=job.get("locationsText"), posted=str(job.get("postedOn") or "")[:24])
+            rec.update(where=job.get("locationsText"), posted=str(job.get("postedOn") or "")[:24],
+                       jd_workday=f"{NVIDIA_HOST}/wday/cxs/nvidia/{NVIDIA_SITE}{path}")
             out.setdefault(rec["id"], rec)
     return list(out.values())
 

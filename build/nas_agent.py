@@ -73,6 +73,7 @@ import build_docs
 import job_sources
 import mail_alerts
 import weekly_sweep as sweep
+from tg import DIVIDER, esc, head, link, plain, quote, telegram
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "build" / ".nas_state.json"
@@ -232,13 +233,17 @@ def verdict_schema() -> dict:
 
 
 def description(rec: dict) -> str:
-    """The job text: MCF via its API, Greenhouse via the per-job endpoint (Ashby and Lever arrive with
-    rec["desc"] already filled by job_sources). Anything else is judged on title + company."""
-    if rec.get("jd_url"):
+    """The job text: MCF via its API, Greenhouse and Workday via their per-job endpoints (Ashby, Lever
+    and amazon.jobs arrive with rec["desc"] already filled by job_sources). Anything else is judged on
+    title + company."""
+    if rec.get("jd_url") or rec.get("jd_workday"):
         try:
-            req = urllib.request.Request(rec["jd_url"], headers=sweep.UA)
+            req = urllib.request.Request(rec.get("jd_url") or rec["jd_workday"], headers=sweep.UA)
             with urllib.request.urlopen(req, timeout=30) as r:
-                return job_sources._plain(json.load(r).get("content")) or "(empty description)"
+                data = json.load(r)
+            text = data.get("content") if rec.get("jd_url") else \
+                (data.get("jobPostingInfo") or {}).get("jobDescription")
+            return job_sources._plain(text) or "(empty description)"
         except Exception as exc:
             return f"(description unavailable: {exc})"
     if rec.get("source") != "MyCareersFuture":
@@ -358,26 +363,37 @@ def plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
+def job_block(r: dict, v: dict) -> list[str]:
+    """The job itself as card lines: title + employer, pay/fit/risk, source, why, gaps, posting link."""
+    src = f"📬 via {esc(r['source'])}" if str(r.get("source", "")).startswith("email") else ""
+    lines = [f"💼 <b>{esc(r['title'])}</b> · {esc(r['company'].title())}",
+             f"💰 {esc(pay_text(r))}  ·  🎯 fit <b>{esc(v.get('score'))}</b>/100  ·  "
+             f"🧪 coding-test risk {esc(v.get('coding_test_risk', '?'))}",
+             src, f"✅ <b>Why:</b> {esc(v.get('reason'))}", f"⚠️ <b>Gaps:</b> {esc(v.get('gaps'))}",
+             "🔗 " + link(r["url"], "Open posting") if r.get("url") else ""]
+    return [x for x in lines if x]
+
+
 def alert_text(r: dict, v: dict, folder: Path, ref: int | None = None) -> str:
-    pay = pay_text(r)
-    head = "🔥 APPLY TODAY ·" if int(v.get("score") or 0) >= URGENT_SCORE else "🆕"
-    src = f" · via {r['source']}" if str(r.get("source", "")).startswith("email") else ""
-    text = (f"{head} {r['title']} — {r['company'].title()}\n{pay} · fit {v['score']}/100 · "
-            f"coding-test risk {v.get('coding_test_risk', '?')}{src}\n\nWhy: {v.get('reason')}\n"
-            f"Gaps: {v.get('gaps')}\n\n{r.get('url', '')}\n")
+    urgent = int(v.get("score") or 0) >= URGENT_SCORE
+    blocks = [head("urgent" if urgent else "fit", f"fit {v.get('score')}/100"), "\n".join(job_block(r, v))]
     if v.get("outreach"):
         who = v.get("contact_titles") or ["the hiring manager"]
-        text += (f"\n👤 Reach out to: {', '.join(who)}\n{people_search(r['company'], who[0])}\n"
-                 f"Note: {v['outreach']}\n")
+        blocks.append(f"👤 <b>Reach out to:</b> {esc(', '.join(who))}\n"
+                      f"🔎 {link(people_search(r['company'], who[0]), 'People search')}\n"
+                      f"📝 <code>{esc(v['outreach'])}</code>")
+    docs = []
     if v.get("factcheck") is not None:
         n = len(v["factcheck"])
-        text += f"\n✔ Fact-checked against your resume: {'no changes' if not n else plural(n, 'claim') + ' corrected, see fit.md'}\n"
+        docs.append(f"✔ Fact-checked against your resume: "
+                    f"{'no changes' if not n else plural(n, 'claim') + ' corrected, see fit.md'}")
     elif v.get("factcheck_error"):
-        text += "\n⚠️ Not fact-checked (the check failed) — read the letter carefully.\n"
-    text += f"\nResume + cover letter: NAS docker/job-hunter/tailored-auto/{folder.name}/\n"
+        docs.append("⚠️ Not fact-checked (the check failed) — read the letter carefully.")
+    docs.append(f"📁 Resume + cover letter: <code>docker/job-hunter/tailored-auto/{esc(folder.name)}/</code>")
     if ref:
-        text += f"Ref #{ref} — send /applied {ref} once you've applied.\n"
-    return text + "Nothing was submitted — your call."
+        docs.append(f"🔖 Ref <b>#{ref}</b> — send <code>/applied {ref}</code> once you've applied.")
+    blocks += ["\n".join(docs), "<i>Nothing was submitted — your call.</i>"]
+    return "\n\n".join(blocks)
 
 
 def track(state: dict, key: str, rec: dict, v: dict | None, folder: Path | None, status: str = "drafted") -> int:
@@ -394,19 +410,6 @@ def track(state: dict, key: str, rec: dict, v: dict | None, folder: Path | None,
     if folder is not None:
         entry["folder"] = folder.name
     return entry["ref"]
-
-
-def telegram(text: str, thread: str | int | None = None) -> None:
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not (token and chat):
-        print("[TG] not configured:\n" + text)
-        return
-    fields = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": "true"}
-    thread = thread or os.environ.get("TELEGRAM_THREAD_ID")
-    if thread:  # a forum topic, e.g. t.me/c/<chat>/<topic>
-        fields["message_thread_id"] = str(thread)
-    data = urllib.parse.urlencode(fields).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30)
 
 
 def _now() -> str:
@@ -446,8 +449,9 @@ def recover_state(exc: Exception) -> dict:
     state["restored"] = {"at": _now(), "from": source, "error": str(exc)[:200]}
     save_state(state)
     try:
-        telegram(f"🩹 The state file couldn't be read ({type(exc).__name__}: {str(exc)[:120]}). Restored from {source}. "
-                 f"The broken copy is kept as build/{broken.name}.")
+        telegram(f"{head('restored', source)}\n\n"
+                 f"🩹 The state file couldn't be read\n🧾 <code>{esc(type(exc).__name__)}: {esc(str(exc)[:120])}</code>\n"
+                 f"📁 Broken copy kept as <code>build/{esc(broken.name)}</code>")
     except Exception:
         pass
     return state
@@ -502,9 +506,10 @@ def cycle() -> None:
                 state.setdefault("fps", {})[fingerprint(r["company"], r["title"])] = ident(r)
         _finish(state, {"candidates": len(jobs), "new": len(jobs), "judged": 0, "fits": 0, "failed": 0,
                         "note": "baseline"})
-        telegram(f"Job watcher online on the NAS. Baseline: {len(jobs)} current postings; "
-                 f"I'll message you when something new fits (checking every {BUSY_INTERVAL_H:g}h in "
-                 f"working hours, {INTERVAL_H:g}h otherwise).")
+        telegram(f"{head('online', 'on the NAS')}\n\n"
+                 f"🗂 <b>Baseline</b> · {len(jobs)} current postings\n"
+                 f"🔔 I'll message you when something new fits\n"
+                 f"⏰ Every {BUSY_INTERVAL_H:g}h in working hours, {INTERVAL_H:g}h otherwise")
         return
 
     new = [r for r in jobs if ident(r) not in seen]
@@ -565,9 +570,10 @@ def cycle() -> None:
     if failed and not judged and not heal("every judge call in a sweep failed", last_fail):
         # Every judge call failed: usually the CLI is signed out, rate-limited or offline. Say so instead of
         # silently retrying forever.
-        telegram(f"⚠️ Job watcher: all {failed} judge calls failed ({last_fail[:200]}). "
-                 f"Check the Claude login (CLAUDE_CODE_OAUTH_TOKEN) or limits. Postings stay unseen and retry "
-                 f"next cycle.")
+        telegram(f"{head('failing', f'all {failed} judge calls failed')}\n\n"
+                 f"🧾 <code>{esc(last_fail[:200])}</code>\n"
+                 f"🔑 Check the Claude login (<code>CLAUDE_CODE_OAUTH_TOKEN</code>) or limits\n\n"
+                 f"<i>Postings stay unseen and retry next cycle.</i>")
 
 
 COMPANY_NOISE = re.compile(r"\b(pte|ltd|limited|inc|llc|plc|corp|corporation|co|company|group|holdings|"
@@ -719,20 +725,25 @@ def record_outcome(arg: str, status: str) -> str:
             "interview": "Good luck! Prep pack coming.", "offer": "🎉 Congratulations!",
             "rejected": "Noted. It still helps calibrate the threshold.",
             "ghosted": "Noted."}[status]
-    return f"✅ #{ref} {entry['t']} — {entry['c']}: {status}. {tail}"
+    return (f"{head('outcome', status)}\n\n{MARK.get(status, '⚪')} <b>#{ref}</b> {esc(entry['t'])} · "
+            f"{esc(entry['c'])}\n<i>{esc(tail)}</i>")
 
 
 STATUS_ORDER = ["offer", "interview", "applied", "drafted", "rejected", "ghosted"]
+# 🆕 new, 🟢 good for James, 🔴 bad, ⚪ waiting, ❌ gone.
+MARK = {"drafted": "🆕", "applied": "⚪", "interview": "🟢", "offer": "🟢", "rejected": "🔴", "ghosted": "❌"}
 
 
 def pipeline_text(state: dict, limit: int = 30) -> str:
+    """Tracked applications, one line each (Telegram HTML; plain() it for prompts)."""
     rows = [e for e in state.get("seen", {}).values() if e.get("ref")]
     rows.sort(key=lambda e: (STATUS_ORDER.index(e.get("status", "drafted")), -e["ref"]))
     lines = []
     for e in rows[:limit]:
         since = _age((e.get("history") or [[None, None]])[-1][1])
-        lines.append(f"#{e['ref']} {e.get('status', '?'):<9} {e['t']} — {e['c']}"
-                     + (f" (fit {e['fit']})" if e.get("fit") is not None else "") + f", {since}")
+        lines.append(f"{MARK.get(e.get('status'), '⚪')} <b>#{e['ref']}</b> {esc(e.get('status', '?'))} · "
+                     f"{esc(e['t'])} — {esc(e['c'])}"
+                     + (f" · fit {esc(e['fit'])}" if e.get("fit") is not None else "") + f" · <i>{esc(since)}</i>")
     return "\n".join(lines)
 
 
@@ -771,7 +782,7 @@ def prep_pack(arg: str) -> str:
                                      url=e.get("url", ""), fit=fit[:1500]))
     if folder and folder.is_dir():  # the draft folder may have been cleaned up by hand
         (folder / "prep.md").write_text(pack + "\n", encoding="utf-8")
-    return "📚 " + pack
+    return f"{head('prep', e['t'] + ' — ' + e['c'])}\n\n{esc(pack)}"
 
 
 FOLLOWUP_PROMPT = """Draft a short, polite follow-up email (subject line + at most 90 words) from the
@@ -807,8 +818,11 @@ def chores(now: dt.datetime | None = None) -> None:
                                                           company=e["c"], url=e.get("url", "")))
                 except Exception as exc:
                     draft = f"(couldn't draft one: {exc})"
-                telegram(f"⏰ #{e['ref']} {e['t']} — {e['c']}: applied {FOLLOWUP_DAYS}+ days ago, no update. "
-                         f"Worth a follow-up (or /ghosted {e['ref']}).\n\n{draft}")
+                telegram(head("followup", f"#{e['ref']}") + "\n\n"
+                         f"💼 <b>{esc(e['t'])}</b> · {esc(e['c'])}\n"
+                         f"📅 Applied {FOLLOWUP_DAYS}+ days ago, no update\n"
+                         f"👉 Worth a follow-up (or <code>/ghosted {e['ref']}</code>)\n\n"
+                         + quote("✉️ <b>Draft</b>", esc(draft)))
                 e["followup_sent"] = _now()
                 save_state(state)
     week = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
@@ -839,54 +853,59 @@ def digest_text(state: dict, now: dt.datetime | None = None) -> str:
     runs = [r for r in state.get("runs") or [] if r.get("at", "") >= since]
     tracked = [e for e in state.get("seen", {}).values() if e.get("ref")]
     moved = lambda st: sum(1 for e in tracked for s, at in e.get("history") or [] if s == st and at >= since)  # noqa: E731
-    lines = [f"📊 Weekly job-hunt digest (week to {now:%d %b})",
-             f"Sweeps {len(runs)} · judged {sum(r.get('judged') or 0 for r in runs)} · "
-             f"fits {sum(r.get('fits') or 0 for r in runs)} · Claude ${sum(r.get('cost_usd') or 0 for r in runs):.2f}",
-             f"This week: applied {moved('applied')}, interviews {moved('interview')}, offers {moved('offer')}, "
-             f"rejections {moved('rejected')}"]
+    blocks = [head("digest", f"week to {now:%d %b}"),
+              f"🔎 <b>Sweeps</b> {len(runs)} · judged {sum(r.get('judged') or 0 for r in runs)} · "
+              f"fits {sum(r.get('fits') or 0 for r in runs)}\n"
+              f"💳 Claude <code>${sum(r.get('cost_usd') or 0 for r in runs):.2f}</code>\n"
+              f"📅 <b>This week</b> · applied {moved('applied')}, interviews {moved('interview')}, "
+              f"offers {moved('offer')}, rejections {moved('rejected')}"]
     applied = [e for e in tracked if any(s == "applied" for s, _ in e.get("history") or [])]
     replied = [e for e in applied if e.get("status") in ("interview", "offer")]
+    stats = []
     if applied:
-        lines.append(f"All time: {len(applied)} applied → {plural(len(replied), 'interview')} "
+        stats.append(f"📈 <b>All time</b> · {len(applied)} applied → {plural(len(replied), 'interview')} "
                      f"({100 * len(replied) // len(applied)}% reply rate)")
         by_src: dict[str, list[int]] = {}
         for e in applied:
             src = (e.get("source") or "board").split(":")[-1]
             by_src.setdefault(src, [0, 0])[0] += 1
             by_src[src][1] += e in replied
-        lines.append("By source: " + ", ".join(f"{k} {v[1]}/{v[0]}" for k, v in sorted(by_src.items())))
+        stats.append("🧭 By source: " + esc(", ".join(f"{k} {v[1]}/{v[0]}" for k, v in sorted(by_src.items()))))
     unapplied = [e for e in tracked if e.get("status") == "drafted"]
     if unapplied:
-        lines.append(f"{len(unapplied)} drafted but not applied — /pipeline to review.")
+        stats.append(f"🆕 {len(unapplied)} drafted but not applied — /pipeline to review")
     scored = [e for e in applied if e.get("fit") is not None]
     good = [e["fit"] for e in scored if e in replied]
     bad = [e["fit"] for e in scored if e.get("status") in ("rejected", "ghosted")]
     if len(good) >= 3 and len(bad) >= 3:
-        lines.append(f"Calibration: interviews came at avg fit {sum(good) / len(good):.0f}, "
-                     f"no-reply/rejections at {sum(bad) / len(bad):.0f} (threshold {FIT_THRESHOLD}).")
+        stats.append(f"🎯 Calibration: interviews came at avg fit {sum(good) / len(good):.0f}, "
+                     f"no-reply/rejections at {sum(bad) / len(bad):.0f} (threshold {FIT_THRESHOLD})")
         if min(good) > FIT_THRESHOLD + 5:
-            lines.append(f"Every interview scored ≥{min(good)}; consider FIT_THRESHOLD={min(good) - 5} to cut noise.")
+            stats.append(f"<i>Every interview scored ≥{min(good)}; consider "
+                         f"<code>FIT_THRESHOLD={min(good) - 5}</code> to cut noise.</i>")
+    if stats:
+        blocks.append("\n".join(stats))
     active = pipeline_text({"seen": {k: e for k, e in state.get("seen", {}).items()
                                      if e.get("status") in ("applied", "interview", "offer")}}, 10)
     if active:
-        lines += ["", "Active:", active]
-    return "\n".join(lines)
+        blocks.append(f"{DIVIDER}\n🗂 <b>Active</b>\n{active}")
+    return "\n\n".join(blocks)
 
 
 # ---- Telegram commands -------------------------------------------------------------------------
 
-HELP = ("Job watcher commands:\n"
-        "/status — health, last cycle, recent runs\n"
-        "/ask <question> — ask the model about seen jobs, drafts, or the system\n"
-        "/judge <url> [pasted job text] — judge one posting now, draft if it fits\n"
-        "…or just share a job link here (LinkedIn/JobStreet app → Share → Telegram)\n"
-        "/sweep — run a cycle now\n"
-        "/applied, /interview, /offer, /rejected, /ghosted <ref or text> — record an outcome "
+HELP = (head("help", "job watcher") + "\n\n"
+        "🟢 /status · health, last cycle, recent runs\n"
+        "🤔 /ask &lt;question&gt; · ask the model about seen jobs, drafts, or the system\n"
+        "⚖️ /judge &lt;url&gt; [pasted job text] · judge one posting now, draft if it fits\n"
+        "🔗 <i>…or just share a job link here (LinkedIn/JobStreet app → Share → Telegram)</i>\n"
+        "🔎 /sweep · run a cycle now\n\n"
+        "✅ /applied, /interview, /offer, /rejected, /ghosted &lt;ref or text&gt; · record an outcome "
         "(/interview also builds a prep pack)\n"
-        "/pipeline — tracked applications\n"
-        "/selfcheck — test Claude, the job boards, mail and storage for real\n"
-        "/heal — diagnose the last error and apply safe fixes\n"
-        "Nothing here ever applies anywhere.")
+        "🗂 /pipeline · tracked applications\n\n"
+        "🩺 /selfcheck · test Claude, the job boards, mail and storage for real\n"
+        "🩹 /heal · diagnose the last error and apply safe fixes\n\n"
+        "<i>Nothing here ever applies anywhere.</i>")
 ASK_PROMPT = """You are the assistant inside James's self-hosted job watcher (a Docker container on his NAS).
 Answer his question briefly and concretely, in plain text (no markdown tables), from the context below.
 If the context does not contain the answer, say so rather than guessing. Never claim anything was applied to.
@@ -933,22 +952,24 @@ def _when(stamp: str | None) -> str:
 
 
 def status_text(state: dict) -> str:
+    """Health report (Telegram HTML; plain() it for prompts)."""
     runs = state.get("runs") or []
-    lines = [f"Heartbeat: {_age(state.get('heartbeat'))}",
-             f"Last sweep: {_age(state.get('last_cycle'))} (every {interval_now():g}h now; "
-             f"{BUSY_INTERVAL_H:g}h weekdays {BUSY_HOURS[0]}-{BUSY_HOURS[1]}h, else {INTERVAL_H:g}h)",
-             f"Model: {MODEL} via claude -p ({claude_ok()})",
-             f"Code: {code_version()}",
-             f"Postings tracked: {len(state.get('seen', {}))}"]
+    blocks = [head("status", "job watcher"),
+              f"💓 <b>Heartbeat</b> · {_age(state.get('heartbeat'))}\n"
+              f"🔎 <b>Last sweep</b> · {_age(state.get('last_cycle'))} (every {interval_now():g}h now; "
+              f"{BUSY_INTERVAL_H:g}h weekdays {BUSY_HOURS[0]}-{BUSY_HOURS[1]}h, else {INTERVAL_H:g}h)\n"
+              f"🤖 <b>Model</b> · {esc(MODEL)} via claude -p ({esc(claude_ok())})\n"
+              f"📦 <b>Code</b> · <code>{esc(code_version())}</code>\n"
+              f"🗂 <b>Postings tracked</b> · {len(state.get('seen', {}))}"]
     if state.get("last_error"):
         e = state["last_error"]
-        lines.append(f"Last error {_age(e.get('at'))}: {e.get('error', '')[-400:]}")
-    for r in runs[-5:]:
-        lines.append(f"- {_when(r.get('at'))}: {r.get('candidates')} cand, {r.get('new')} new, "
-                     f"{r.get('judged')} judged, {r.get('fits')} fit, {r.get('dups', 0)} dup, {r.get('failed')} failed, "
-                     f"${r.get('cost_usd', 0):.2f}"
-                     + (f" ({r['note']})" if r.get("note") else ""))
-    return "\n".join(lines)
+        blocks.append(f"🔴 <b>Last error</b> · {_age(e.get('at'))}\n<code>{esc(e.get('error', '')[-400:])}</code>")
+    if runs:
+        blocks.append(DIVIDER + "\n" + quote("🧾 <b>Recent runs</b>", "\n".join(
+            f"{_when(r.get('at'))}: {r.get('candidates')} cand, {r.get('new')} new, {r.get('judged')} judged, "
+            f"{r.get('fits')} fit, {r.get('dups', 0)} dup, {r.get('failed')} failed, ${r.get('cost_usd', 0):.2f}"
+            + (f" ({esc(r['note'])})" if r.get("note") else "") for r in runs[-5:])))
+    return "\n\n".join(blocks)
 
 
 def ask(question: str) -> str:
@@ -959,8 +980,8 @@ def ask(question: str) -> str:
                             for v in judged) or "(none yet)"
     drafts = sorted(OUT.glob("*/fit.md"), key=lambda f: f.stat().st_mtime)[-8:] if OUT.exists() else []
     drafts_txt = "\n\n".join(f.read_text(encoding="utf-8")[:800] for f in drafts) or "(none yet)"
-    prompt = ASK_PROMPT.format(today=dt.date.today(), profile=profile(), status=status_text(state),
-                               judged=judged_txt, drafts=drafts_txt, pipeline=pipeline_text(state, 40),
+    prompt = ASK_PROMPT.format(today=dt.date.today(), profile=profile(), status=plain(status_text(state)),
+                               judged=judged_txt, drafts=drafts_txt, pipeline=plain(pipeline_text(state, 40)),
                                question=question)
     return claude(prompt) or "(the model returned nothing)"
 
@@ -1042,8 +1063,7 @@ def judge_command(arg: str) -> str:
         ref = track(state, rec.get("uuid") or rec["id"], rec, v, folder)
         save_state(state)
         return alert_text(rec, v, folder, ref)
-    return (f"❌ {rec['title']} — {rec['company']}\nfit {v.get('score')}/100 (threshold {FIT_THRESHOLD}) · "
-            f"coding-test risk {v.get('coding_test_risk', '?')}\n\nWhy: {v.get('reason')}\nGaps: {v.get('gaps')}")
+    return head("notfit", f"fit {v.get('score')}/100, threshold {FIT_THRESHOLD}") + "\n\n" + "\n".join(job_block(rec, v))
 
 
 PENDING_H = 2  # how long the bot waits for a pasted description after asking for one
@@ -1058,23 +1078,24 @@ def shared(text: str, thread) -> None:
     try:
         if urls:
             for url in urls:
-                telegram(f"⏳ Reading and judging {url}", thread)
+                telegram(head("working", "reading and judging") + " " + link(url, "this link"), thread)
                 try:
                     telegram(judge_command(url), thread)
                 except Unreadable as exc:
                     state = load_state()
                     state["pending_judge"] = {"url": exc.url, "at": _now()}
                     save_state(state)
-                    telegram("🔒 That page needs a login, so I can't read it. Paste the job description (title, "
-                             "company and the full text) as your next message and I'll judge it against this link.",
-                             thread)
+                    telegram(head("login", "paste the job text") + "\n\n"
+                             "🔒 That page needs a login, so I can't read it.\n"
+                             "📋 Paste the job description (title, company and the full text) as your next message"
+                             " and I'll judge it against " + link(exc.url, "this link") + ".", thread)
         elif pending and len(text) >= 200 and (_hours_since(pending.get("at")) or 99) < PENDING_H:
             state.pop("pending_judge", None)
             save_state(state)
-            telegram("⏳ Judging the pasted description…", thread)
+            telegram(head("working", "judging the pasted description…"), thread)
             telegram(judge_command(f"{pending['url']} {text}"), thread)
     except Exception as exc:
-        telegram(f"⚠️ Couldn't judge that: {type(exc).__name__}: {exc}", thread)
+        telegram(head("error", "couldn't judge that") + f"\n\n🧾 <code>{esc(type(exc).__name__)}: {esc(exc)}</code>", thread)
 
 
 def _hours_since(stamp: str | None) -> float | None:
@@ -1082,6 +1103,11 @@ def _hours_since(stamp: str | None) -> float | None:
         return (dt.datetime.now() - dt.datetime.fromisoformat(stamp)).total_seconds() / 3600
     except (TypeError, ValueError):
         return None
+
+
+def usage(text: str) -> str:
+    """`text` is HTML (escape the &lt;placeholders&gt;)."""
+    return f"{head('usage')}\n\n<i>Usage: {text}</i>"
 
 
 def poll_commands(state: dict, wait: int) -> bool:
@@ -1122,42 +1148,46 @@ def poll_commands(state: dict, wait: int) -> bool:
             if cmd in ("/help", "/start"):
                 telegram(HELP, thread)
             elif cmd == "/status":
-                telegram("🟢 " + status_text(load_state()), thread)
+                telegram(status_text(load_state()), thread)
             elif cmd == "/ask":
                 if not arg.strip():
-                    telegram("Usage: /ask <question>, e.g. /ask which of this week's roles fit best?", thread)
+                    telegram(usage("/ask &lt;question&gt;, e.g. /ask which of this week's roles fit best?"), thread)
                 else:
-                    telegram("🤔 " + ask(arg.strip()), thread)
+                    telegram(f"{head('ask', arg.strip()[:60])}\n\n{esc(ask(arg.strip()))}", thread)
             elif cmd == "/judge":
                 if not arg.strip():
-                    telegram("Usage: /judge <url> [pasted job description]", thread)
+                    telegram(usage("/judge &lt;url&gt; [pasted job description]"), thread)
                 else:
-                    telegram("⏳ Reading and judging…", thread)
+                    telegram(head("working", "reading and judging…"), thread)
                     telegram(judge_command(arg), thread)
             elif cmd in OUTCOMES:
                 if not arg.strip():
-                    telegram(f"Usage: {cmd} <ref number from the alert, or the role and company>", thread)
+                    telegram(usage(f"{cmd} &lt;ref number from the alert, or the role and company&gt;"), thread)
                 else:
                     telegram(record_outcome(arg.strip(), OUTCOMES[cmd]), thread)
                     if OUTCOMES[cmd] == "interview":
-                        telegram("⏳ Building the interview prep pack…", thread)
+                        telegram(head("working", "building the interview prep pack…"), thread)
                         telegram(prep_pack(arg.strip()), thread)
             elif cmd == "/heal":
                 err = (load_state().get("last_error") or {}).get("error") or arg.strip()
                 if not err:
-                    telegram("No recorded error to heal. Send /heal <what's wrong> to describe one.", thread)
+                    telegram(f"{head('heal', 'nothing to heal')}\n\n<i>No recorded error. Send "
+                             f"/heal &lt;what's wrong&gt; to describe one.</i>", thread)
                 elif not heal("manual /heal", err, force=True, thread=thread):
-                    telegram("Self-heal is off or over today's limit (HEAL, HEAL_MAX_PER_DAY).", thread)
+                    telegram(f"{head('heal', 'not run')}\n\n<i>Self-heal is off or over today's limit "
+                             f"(<code>HEAL</code>, <code>HEAL_MAX_PER_DAY</code>).</i>", thread)
             elif cmd == "/selfcheck":
-                telegram("⏳ Running the self-check (about 30s)…", thread)
+                telegram(head("working", "running the self-check (about 30s)…"), thread)
                 telegram(selfcheck(), thread)
             elif cmd == "/pipeline":
-                telegram(pipeline_text(load_state()) or "Nothing tracked yet.", thread)
+                rows = pipeline_text(load_state())
+                telegram(f"{head('pipeline', 'tracked applications')}\n\n{rows or '<i>Nothing tracked yet.</i>'}", thread)
             elif cmd == "/sweep":
-                telegram("Running a sweep now…", thread)
+                telegram(head("working", "running a sweep now…"), thread)
                 sweep_now = True
         except Exception as exc:
-            telegram(f"⚠️ {cmd} failed: {type(exc).__name__}: {exc}", thread)
+            telegram(f"{head('error', cmd + ' failed')}\n\n🧾 <code>{esc(type(exc).__name__)}: {esc(exc)}</code>",
+                     thread)
     return sweep_now
 
 
@@ -1197,7 +1227,7 @@ def interval_now(now: dt.datetime | None = None) -> float:
 def selfcheck() -> str:
     """Exercise every live dependency once and report. Each check is independent: one failure never
     hides the others. Costs one tiny haiku call."""
-    lines = ["🩺 Self-check"]
+    lines = [head("selfcheck", "every live dependency"), ""]
 
     def run(label: str, fn) -> None:
         start = time.time()
@@ -1206,7 +1236,7 @@ def selfcheck() -> str:
         except Exception as exc:
             ok, detail = False, f"{type(exc).__name__}: {str(exc)[:160]}"
         mark = {True: "✅", False: "❌", None: "⚪"}[ok]
-        lines.append(f"{mark} {label}: {detail} ({time.time() - start:.1f}s)")
+        lines.append(f"{mark} <b>{esc(label)}</b> · {esc(detail)} <i>({time.time() - start:.1f}s)</i>")
 
     def claude_check():
         reply = claude("Reply with the single word OK and nothing else.", model=EXTRACT_MODEL)
@@ -1269,17 +1299,17 @@ def selfcheck() -> str:
         run("Alert emails", mail_check)
     run("Storage", storage_check)
     state = load_state()
-    lines.append(f"ℹ️ Heartbeat {_age(state.get('heartbeat'))}, last sweep {_age(state.get('last_cycle'))}, "
-                 f"code {code_version()}")
     bad = sum(line.startswith("❌") for line in lines)
-    lines.append("All good." if not bad else f"{bad} problem(s) above.")
+    lines += ["", f"ℹ️ Heartbeat {_age(state.get('heartbeat'))}, last sweep {_age(state.get('last_cycle'))}, "
+                  f"code <code>{esc(code_version())}</code>",
+              "<i>All good.</i>" if not bad else f"<b>{bad} problem(s) above.</b>"]
     return "\n".join(lines)
 
 
 def main() -> None:
     if "--selfcheck" in sys.argv:
         report = selfcheck()
-        print(report)
+        print(plain(report))
         sys.exit(1 if "❌" in report else 0)
     once = "--once" in sys.argv
     if not once:
@@ -1294,7 +1324,7 @@ def main() -> None:
     while True:
         if not guarded(cycle):
             try:
-                telegram("⚠️ Job watcher sweep failed — see /status (self-heal is looking at it).")
+                telegram(head("error", "sweep failed") + "\n\n<i>See /status (self-heal is looking at it).</i>")
             except Exception:
                 pass
         if once:
@@ -1341,7 +1371,7 @@ def stall_check() -> bool:
         state["stalled"] = {"at": _now(), "minutes": round(stalled)}
         state["last_error"] = {"at": _now(), "error": f"stalled: no progress for {stalled:.0f} min"}
         save_state(state)
-        telegram(f"🔁 Job watcher made no progress for {stalled:.0f} min; restarting itself.")
+        telegram(head("restart", "stalled") + f"\n\n🔁 No progress for {stalled:.0f} min; restarting itself.")
     except Exception:
         pass
     EXIT(3)
@@ -1368,7 +1398,8 @@ def startup_checks() -> None:
         print(f"  ! {len(starts)} starts in the last hour: backing off 10 min")
         if len(starts) == 6:  # say it once per loop, not on every restart
             try:
-                telegram(f"🔁 Job watcher restarted {len(starts)} times in an hour; slowing down and diagnosing.")
+                telegram(head("restart", "crash loop") + f"\n\n🔁 Restarted {len(starts)} times in an hour; "
+                         f"slowing down and diagnosing.")
             except Exception:
                 pass
         heal("crash loop: restarting repeatedly", (state.get("last_error") or {}).get("error", "unknown"))
@@ -1427,7 +1458,7 @@ def _signature(trigger: str, error: str) -> str:
 
 def _code_context(error: str) -> str:
     """The lines around the last two frames of the traceback that are in this project's code."""
-    frames = re.findall(r'File "([^"]*/build/[\w.]+\.py)", line (\d+)', error)[-2:]
+    frames = re.findall(r'File "([^"]*[/\\]build[/\\][\w.]+\.py)", line (\d+)', error)[-2:]  # / or \ (Windows)
     out = []
     for path, line in frames:
         try:
@@ -1450,7 +1481,7 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
         try:
             telegram(text, thread)
         except Exception as exc:
-            print(f"  ! self-heal message not sent: {exc}\n{text}")
+            print(f"  ! self-heal message not sent: {exc}\n{plain(text)}")
     state = load_state()
     day_ago = (dt.datetime.now() - dt.timedelta(days=1)).isoformat(timespec="seconds")
     six_ago = (dt.datetime.now() - dt.timedelta(hours=6)).isoformat(timespec="seconds")
@@ -1462,16 +1493,17 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
     save_state(state)
 
     if LOGIN_ERROR.search(error):  # Claude can't diagnose its own missing login: say what to do directly
-        _say("🔑 Self-heal: Claude isn't logged in (or the token expired), so judging is paused.\n"
-                 "Fix: on your PC run `claude setup-token`, put the token in .env as CLAUDE_CODE_OAUTH_TOKEN, "
-                 "then run `sh deploy/nas/update.sh` on the NAS. Postings wait unseen until then; nothing is lost.",
-                 thread)
+        _say(f"{head('key', 'judging paused')}\n\n"
+             "🔑 Claude isn't logged in (or the token expired)\n"
+             "🛠 Fix: on your PC run <code>claude setup-token</code>, put the token in <code>.env</code> as "
+             "<code>CLAUDE_CODE_OAUTH_TOKEN</code>, then run <code>sh deploy/nas/update.sh</code> on the NAS\n\n"
+             "<i>Postings wait unseen until then; nothing is lost.</i>", thread)
         return True
 
     runs = "; ".join(f"{_when(r.get('at'))}: {r.get('judged')} judged, {r.get('failed')} failed"
                      + (f" ({r['note'][:80]})" if r.get("note") else "") for r in (state.get("runs") or [])[-5:])
     try:
-        check = selfcheck()
+        check = plain(selfcheck())
     except Exception as exc:
         check = f"(self-check failed: {exc})"
     usage = shutil.disk_usage(STATE.parent)
@@ -1483,9 +1515,10 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
             error=error[-3000:], runs=runs or "none", selfcheck=check, disk=f"{usage.free // 2**20} MB",
             code=code_version(), settings=settings, code_ctx=_code_context(error)), HEAL_SCHEMA)
     except Exception as exc:
-        _say(f"🩹 Self-heal couldn't reach Claude to diagnose ({type(exc).__name__}: {str(exc)[:150]}).\n"
-                 f"Failure: {trigger}\n{error.strip().splitlines()[-1][:300] if error.strip() else ''}\n"
-                 f"Try /selfcheck.", thread)
+        last = error.strip().splitlines()[-1][:300] if error.strip() else ""
+        _say(f"{head('heal', trigger)}\n\n"
+             f"🔴 Couldn't reach Claude to diagnose\n🧾 <code>{esc(type(exc).__name__)}: {esc(str(exc)[:150])}</code>\n"
+             f"💥 Failure: <code>{esc(last)}</code>\n\n<i>Try /selfcheck.</i>", thread)
         return True
 
     done, restart = [], False
@@ -1503,12 +1536,14 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
         folder.mkdir(exist_ok=True)
         name = f"{dt.datetime.now():%Y%m%d-%H%M}-{sig}.diff"
         (folder / name).write_text(got["patch"].strip() + "\n", encoding="utf-8")
-        patch_note = f"\n📝 Proposed code fix saved as build/patches/{name} (NOT applied; review it first)."
+        patch_note = (f"\n📝 Proposed code fix saved as <code>build/patches/{esc(name)}</code> "
+                      f"<b>(NOT applied; review it first)</b>")
     if restart:
         done.append(HEAL_ACTIONS["restart_process"])
-    _say(f"🩹 Self-heal: {trigger}\nCause ({got.get('cause')}): {got.get('diagnosis')}\n"
-             f"Did: {'; '.join(done) or 'nothing needed'}"
-             + (f"\nYou: {got['user_steps']}" if got.get("user_steps") else "") + patch_note, thread)
+    _say(f"{head('heal', trigger)}\n\n"
+         f"🔍 <b>Cause</b> ({esc(got.get('cause'))}) · {esc(got.get('diagnosis'))}\n"
+         f"🛠 <b>Did</b> · {esc('; '.join(done) or 'nothing needed')}"
+         + (f"\n👤 <b>You</b> · {esc(got['user_steps'])}" if got.get("user_steps") else "") + patch_note, thread)
     if restart:
         EXIT(3)
     return True
