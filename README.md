@@ -24,9 +24,9 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 - **Cost is capped and nothing gets lost.** `MAX_PER_CYCLE` (default 8) limits LLM calls per cycle. Postings over the cap, and any whose judge call fails, stay *unseen* and are retried next cycle rather than dropped. The first run only records a baseline, so turning it on doesn't flood you with every live posting.
 - **Coverage beyond scraping, without scraping.** LinkedIn, JobStreet, Glassdoor and Indeed stay login-walled to a crawler. Share a job from their app to the bot and it's judged like any other posting; when the page is login-walled, the bot asks you to paste the description and judges your next message against that link. Optionally, with `IMAP_*` set, the watcher also reads their alert emails read-only (`BODY.PEEK`, nothing marked read), has a cheap model (`EXTRACT_MODEL`, default `haiku`) list the postings in each, and runs them through the same regex filters and judge (`build/mail_alerts.py`).
 - **Built to get a reply, not just a draft.** Each fit comes with who to contact (likely hiring-manager titles plus a LinkedIn people-search link) and a ≤280-character connection note, also saved as `outreach.md`. Scores ≥ `URGENT_SCORE` are flagged "🔥 APPLY TODAY", and sweeps run every `BUSY_INTERVAL_HOURS` (2h) during weekday working hours so you see postings early.
-- **Outcomes close the loop.** Every fit gets a ref number. `/applied 12`, `/interview 12`, `/rejected 12`… record what happened; `FOLLOWUP_DAYS` after `/applied` with no update you get a nudge with a drafted follow-up email; `/interview` builds a prep pack; a Sunday digest reports reply rate by source and whether `FIT_THRESHOLD` looks miscalibrated.
+- **Outcomes close the loop.** Every fit gets a ref number. `/jobapplied 12`, `/jobinterview 12`, `/jobrejected 12`… record what happened; `FOLLOWUP_DAYS` after `/jobapplied` with no update you get a nudge with a drafted follow-up email; `/jobinterview` builds a prep pack; a Sunday digest reports reply rate by source and whether `FIT_THRESHOLD` looks miscalibrated.
 - **Every draft is fact-checked.** Before a fit is drafted, a second `claude -p` pass compares the tagline, summary, cover letter and outreach note with the resume and removes any claim it doesn't support (a wrong year, tool, certification or employer). The alert says how many claims it corrected and `fit.md` lists them; if the check itself fails, the alert says the draft is unchecked (`FACTCHECK=0` turns it off).
-- **Judged on the real job description where one exists.** MyCareersFuture via its API, Greenhouse via its per-job endpoint, and Ashby and Lever from the description their board API already returns. Only Workday, amazon.jobs, Apple and alert-email postings are judged on title, company and whatever snippet came with them.
+- **Judged on the real job description where one exists.** MyCareersFuture via its API, Greenhouse via its per-job endpoint, and Ashby and Lever from the description their board API already returns. Only Apple and alert-email postings are judged on title, company and whatever snippet came with them.
 - **One role, one alert.** The same job on MyCareersFuture, a LinkedIn alert and the company's own board is recognised by a normalised company + title fingerprint (legal suffixes, "Singapore", punctuation and case removed) and judged once.
 - **The model can read, not act.** Every `claude -p` call runs with `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` and an empty temp directory as its working directory. A job posting that tries prompt injection has no tools and no project files (or `.env`) within reach.
 - **Failures are classified.** A CLI, auth, rate-limit or network failure (`ClaudeError`) is transient and retried next cycle forever. A reply without a valid structured verdict counts toward `MAX_ATTEMPTS`.
@@ -36,11 +36,11 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 ## What it looks like in Telegram
 
 <table><tr>
-<td width="50%"><img src="docs/telegram-alert.png" alt="Sharing a LinkedIn job, pasting the description behind the login wall, the fit alert with outreach and fact-check, then /applied"></td>
-<td width="50%"><img src="docs/telegram-status.png" alt="/status, /selfcheck, a follow-up reminder with a drafted email, and the weekly digest"></td>
+<td width="50%"><img src="docs/telegram-alert.png" alt="Sharing a LinkedIn job, pasting the description behind the login wall, the fit alert with outreach and fact-check, then /jobapplied"></td>
+<td width="50%"><img src="docs/telegram-status.png" alt="/jobstatus, /jobselfcheck, a follow-up reminder with a drafted email, and the weekly digest"></td>
 </tr><tr>
-<td>Share a job → paste the description if it's login-walled → alert with fit, gaps, who to contact, fact-check and drafts → <code>/applied 12</code>.</td>
-<td><code>/status</code>, <code>/selfcheck</code>, the follow-up nudge 7 days after applying, and the Sunday digest.</td>
+<td>Share a job → paste the description if it's login-walled → alert with fit, gaps, who to contact, fact-check and drafts → <code>/jobapplied 12</code>.</td>
+<td><code>/jobstatus</code>, <code>/jobselfcheck</code>, the follow-up nudge 7 days after applying, and the Sunday digest.</td>
 </tr></table>
 
 <sub>Rendered from the bot's real message code with sample data.</sub>
@@ -57,7 +57,7 @@ Numbers match the diagram.
 6. **Gate.** The posting has to be `suitable`, score ≥ `FIT_THRESHOLD` (70), and come with a letter.
 7. **Draft.** `build_docs.py` renders an ATS-plain resume and cover letter plus a `fit.md` into `tailored-auto/<date_company_role>/`.
 8. **Alert.** One Telegram message goes to a forum topic with the role, pay, score, reasons, gaps, URL, who to reach out to with a drafted note, the path to the draft folder and a ref number.
-9. **Human decides.** You apply (or not) and record it with `/applied <ref>`; follow-up nudges, prep packs and the weekly digest build on that. Nothing is ever sent or submitted for you.
+9. **Human decides.** You apply (or not) and record it with `/jobapplied <ref>`; follow-up nudges, prep packs and the weekly digest build on that. Nothing is ever sent or submitted for you.
 
 Job-alert emails (when `IMAP_*` is set) join the candidate list at step 1 and go through the same steps 2–9.
 
@@ -94,12 +94,12 @@ Environment (put the secrets in `.env`, which is never committed):
 | `CLAUDE_TIMEOUT` | `300` | Seconds per `claude -p` call |
 | `TELEGRAM_BOT_TOKEN` | — | Bot token (if unset, alerts are printed to stdout instead) |
 | `TELEGRAM_CHAT_ID` | — | Target chat |
-| `TELEGRAM_THREAD_ID` | — | Optional forum topic |
+| `TELEGRAM_THREAD_ID` | — | Optional forum topic. When set, the bot posts there and answers only messages in that topic (a shared group's other topics belong to other bots) |
 | `SWEEP_INTERVAL_HOURS` | `6` | Loop interval outside working hours |
 | `BUSY_INTERVAL_HOURS` | `2` | Loop interval Mon–Fri during `BUSY_HOURS` |
 | `BUSY_HOURS` | `8-20` | Local working hours for the faster interval |
 | `URGENT_SCORE` | `85` | Alerts at or above this say "🔥 APPLY TODAY" |
-| `FOLLOWUP_DAYS` | `7` | Days after `/applied` before a follow-up nudge |
+| `FOLLOWUP_DAYS` | `7` | Days after `/jobapplied` before a follow-up nudge |
 | `DIGEST_WEEKDAY` | `6` | Day for the weekly digest (Monday=0, Sunday=6), after 09:00 |
 | `EXTRACT_MODEL` | `haiku` | Model that lists the jobs in an alert email |
 | `IMAP_USER` / `IMAP_PASSWORD` | — | Optional. Mailbox holding your job alerts; for Gmail use an [app password](https://myaccount.google.com/apppasswords) |
@@ -121,18 +121,20 @@ Environment (put the secrets in `.env`, which is never committed):
 
 Between cycles the agent long-polls the bot and answers messages from `TELEGRAM_CHAT_ID` only:
 
+Commands are prefixed `/job` so they never collide with other bots in a shared group; inside the job topic the old short names (`/status`, `/ask`, `/help`, …) still work as aliases. Messages from other topics are ignored, and on a first start (no stored offset) the queued backlog is skipped rather than replayed.
+
 | Command | What it does |
 |---|---|
-| `/status` | Heartbeat, last cycle, `claude` CLI version, last 5 runs with cost, last error. No LLM call. |
-| `/ask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
-| `/judge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
-| `/applied`, `/interview`, `/offer`, `/rejected`, `/ghosted` `<ref or text>` | Records an outcome for the alert with that ref, or for "Role at Company" you found elsewhere. `/interview` also replies with an interview prep pack (saved as `prep.md`). |
-| `/pipeline` | Every tracked application and its status. |
-| `/selfcheck` | Tries every live dependency for real (private files loaded, Claude login, MyCareersFuture, one Greenhouse / Ashby / Lever board incl. a description fetch, the mailbox, storage and backups) and reports ✅ / ❌ / ⚪ with the reason. Also `python build/nas_agent.py --selfcheck`, which `update.sh` runs after every deploy. |
-| *a job link* | Sharing a link (LinkedIn / JobStreet app → Share → Telegram, or just pasting it) is the same as `/judge`. If the page needs a login, the bot says so and judges the description you paste next (within 2h). In a group, turn the bot's privacy mode off (BotFather → `/setprivacy` → Disable) so it can see plain messages; with privacy mode on it only sees commands and replies to its own messages. |
-| `/heal [what's wrong]` | Runs the self-repair step on the last recorded error (or on your description) and reports the diagnosis and what it did. |
-| `/sweep` | Runs a cycle now. |
-| `/help` | Lists the commands. |
+| `/jobstatus` | Heartbeat, last cycle, `claude` CLI version, last 5 runs with cost, last error. No LLM call. |
+| `/jobask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
+| `/jobjudge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
+| `/jobapplied`, `/jobinterview`, `/joboffer`, `/jobrejected`, `/jobghosted` `<ref or text>` | Records an outcome for the alert with that ref, or for "Role at Company" you found elsewhere. `/jobinterview` also replies with an interview prep pack (saved as `prep.md`). |
+| `/jobpipeline` | Every tracked application and its status. |
+| `/jobselfcheck` | Tries every live dependency for real (private files loaded, Claude login, MyCareersFuture, one Greenhouse / Ashby / Lever board incl. a description fetch, the mailbox, storage and backups) and reports ✅ / ❌ / ⚪ with the reason. Also `python build/nas_agent.py --selfcheck`, which `update.sh` runs after every deploy. |
+| *a job link* | Sharing a link (LinkedIn / JobStreet app → Share → Telegram, or just pasting it) is the same as `/jobjudge`. If the page needs a login, the bot says so and judges the description you paste next (within 2h). In a group, turn the bot's privacy mode off (BotFather → `/setprivacy` → Disable) so it can see plain messages; with privacy mode on it only sees commands and replies to its own messages. |
+| `/jobheal [what's wrong]` | Runs the self-repair step on the last recorded error (or on your description) and reports the diagnosis and what it did. |
+| `/jobsweep` | Runs a cycle now. |
+| `/jobhelp` | Lists the commands. |
 
 Only one process may call `getUpdates` per bot token, so nothing else should poll this bot.
 
@@ -141,8 +143,8 @@ Only one process may call `getUpdates` per bot token, so nothing else should pol
 Every cycle, including one with nothing new, writes `last_cycle` and a `runs` entry to `build/.nas_state.json`. The idle loop also refreshes `heartbeat` every `HEARTBEAT_MIN` minutes, and the compose healthcheck marks the container unhealthy once that stamp is over 2h old. If every judge call in a cycle fails (usually the Claude login expired or a usage limit was hit), you get a Telegram warning instead of silent retries.
 
 - **It doesn't die.** Every step of the main loop is guarded: an error is recorded and the loop carries on. A watchdog thread exits the process when the loop makes no progress for `STALL_MIN` (120) minutes, and Docker's `restart: unless-stopped` brings up a clean one. More than 5 starts in an hour backs off 10 minutes. An unreadable state file is swapped for the newest backup that parses (the broken copy is kept), and a failed save is logged instead of crashing. One garbled or dropped board reply skips only that board or search page.
-- **It repairs itself with `claude -p`, within limits.** When a sweep crashes, every judge call fails, the loop stalls or it crash-loops, `heal()` sends Claude the error, the recent sweeps, a `/selfcheck` and the code around the failure. Claude returns a diagnosis and picks remedies from a fixed list that the watcher carries out itself: wait and retry (1h back-off), restore the state from a backup, skip the queued Telegram messages, clear or skip postings that keep failing, pause the email reader for 24h, or restart the process. You get one Telegram message with the cause, what was done and anything you need to do. Claude never runs commands or edits code on the NAS: the container holds your tokens and reads untrusted text (job posts), so a proposed code fix is only saved to `build/patches/` for you to review. A Claude login failure skips the diagnosis and tells you how to renew the token. The same failure is diagnosed at most once per 6h, and at most `HEAL_MAX_PER_DAY` (6) times a day.
-- **Restarts don't re-sweep.** On start the loop waits until the next cycle is due, based on `last_cycle`, so a NAS reboot doesn't trigger a paid sweep. `/sweep` still forces one.
+- **It repairs itself with `claude -p`, within limits.** When a sweep crashes, every judge call fails, the loop stalls or it crash-loops, `heal()` sends Claude the error, the recent sweeps, a `/jobselfcheck` and the code around the failure. Claude returns a diagnosis and picks remedies from a fixed list that the watcher carries out itself: wait and retry (1h back-off), restore the state from a backup, skip the queued Telegram messages, clear or skip postings that keep failing, pause the email reader for 24h, or restart the process. You get one Telegram message with the cause, what was done and anything you need to do. Claude never runs commands or edits code on the NAS: the container holds your tokens and reads untrusted text (job posts), so a proposed code fix is only saved to `build/patches/` for you to review. A Claude login failure skips the diagnosis and tells you how to renew the token. The same failure is diagnosed at most once per 6h, and at most `HEAL_MAX_PER_DAY` (6) times a day.
+- **Restarts don't re-sweep.** On start the loop waits until the next cycle is due, based on `last_cycle`, so a NAS reboot doesn't trigger a paid sweep. `/jobsweep` still forces one.
 - **Retries are bounded.** A posting whose verdict can't be parsed is given up after `MAX_ATTEMPTS` cycles. CLI, auth and network errors never count, so nothing is lost to an outage.
 - **Watchdog on the PC.** `build/watchdog.py` reads the Syncthing copy of the state file and messages Telegram once when the watcher goes quiet (heartbeat over `WATCHDOG_MAX_H`, default 2h), when it's alive but sweeps are stuck (no finished cycle in 2 × interval + 1h), or when the last cycle crashed. It sends one 🟢 message on recovery. Schedule `python build\watchdog.py` every 15 minutes in Task Scheduler; set `JOB_STATE` if the synced file isn't at `build/.nas_state.json`.
 
@@ -158,7 +160,7 @@ cd job-hunter
 sh deploy/nas/update.sh                               # first start, and every update after
 ```
 
-`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the repo root at `/app`, so the code runs straight from the clone. `update.sh` does `git pull --ff-only`, rebuilds the image only when the Dockerfile changed, restarts the container, then runs the self-check and prints the report; `/status` shows the deployed commit. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude. The state file is copied to `build/backups/` once a day, and the last `BACKUP_DAYS` copies are kept; to restore, stop the container and copy one back over `build/.nas_state.json`.
+`deploy/nas/compose.yaml` builds an image from `deploy/nas/Dockerfile` (Python 3.12 + `python-docx` + Node 22 + the Claude Code CLI, installed once at build time) and mounts the repo root at `/app`, so the code runs straight from the clone. `update.sh` does `git pull --ff-only`, rebuilds the image only when the Dockerfile changed, restarts the container, then runs the self-check and prints the report; `/jobstatus` shows the deployed commit. Put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token` on your PC) in `.env`; the container needs outbound internet to reach Claude. The state file is copied to `build/backups/` once a day, and the last `BACKUP_DAYS` copies are kept; to restore, stop the container and copy one back over `build/.nas_state.json`.
 
 ## Project structure
 
@@ -181,13 +183,13 @@ docs/architecture.*     # diagram (draw.io source, SVG, PNG)
 ## Testing & quality
 
 - `python build/selftest.py` runs 14 behaviour checks on the filters (e.g. "GovTech is dropped", "Ellipsys is *not* dropped", "Remote-USA is rejected, APAC accepted") and scans every `build/*.py` for stray control characters. Current result: `ok - 14 behaviour checks pass, 10 files clean of control chars`.
-- `python build/test_nas_agent.py` runs 125 offline checks: staying alive (state recovery, failed saves, the stall watchdog, crash-loop back-off, a main loop that survives failing sweeps, one bad board reply), self-repair (each remedy, the login shortcut, rate limits, saved patches), the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, sharing links (login wall → pasted description), outcome tracking, follow-ups, the digest and backups, `/selfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
+- `python build/test_nas_agent.py` runs 141 offline checks: staying alive (state recovery, failed saves, the stall watchdog, crash-loop back-off, a main loop that survives failing sweeps, one bad board reply), self-repair (each remedy, the login shortcut, rate limits, saved patches), the NAS loop (baseline, quiet cycles, retry cap, pruning, restart scheduling, busy-hours cadence, cross-source dedup), fact-checking, job-description fetching, every Telegram command, sharing links (login wall → pasted description), outcome tracking, follow-ups, the digest and backups, `/jobselfcheck`, alert-email parsing and salary parsing over a fake IMAP server, and the watchdog. Telegram, `claude -p`, IMAP and MyCareersFuture are faked.
 - GitHub Actions runs both on every push and also builds the NAS image and runs the tests inside it (`.github/workflows/selftest.yml`).
 
 ## Design decisions & limitations
 
-- **No login-walled scraping.** LinkedIn, Glassdoor, NodeFlair and JobStreet sit behind logins or bot checks, and this project doesn't try to get around them. Their alert *emails* are read instead; those carry title, company, location and sometimes pay, but not the full description, so they're judged like career-page postings (paste the JD into `/judge` for a full read).
-- **Some postings have no job description in the prompt.** Workday, amazon.jobs, Apple and alert-email postings are judged on title, company and any snippet, so those scores are less reliable than the ones with a full description. `/judge <url> <pasted JD>` gives any of them a full read.
+- **No login-walled scraping.** LinkedIn, Glassdoor, NodeFlair and JobStreet sit behind logins or bot checks, and this project doesn't try to get around them. Their alert *emails* are read instead; those carry title, company, location and sometimes pay, but not the full description, so they're judged like career-page postings (paste the JD into `/jobjudge` for a full read).
+- **Some postings have no job description in the prompt.** Workday, amazon.jobs, Apple and alert-email postings are judged on title, company and any snippet, so those scores are less reliable than the ones with a full description. `/jobjudge <url> <pasted JD>` gives any of them a full read.
 - **JSON-file state, single instance.** That's fine for one container on one NAS. Running more than one would need a real store with locking.
 - **The regex filters are Singapore- and profile-specific.** They're tuned for one person's search, not written as a general-purpose product.
 - **Workday tenants can't be guessed.** Only tenants with verified site IDs are included. The others returned 404/422.

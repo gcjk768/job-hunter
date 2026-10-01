@@ -62,7 +62,7 @@ def problem(state_path: Path, max_h: float, interval_h: float) -> str | None:
     cycle = hours_since(state.get("last_cycle"))
     if cycle is not None and cycle > 2 * interval_h + 1:
         return (f"alive, but the last finished sweep was {cycle:.1f}h ago (due every {interval_h:g}h). "
-                f"Send /status to the bot or check the Log tab.")
+                f"Send /jobstatus to the bot or check the Log tab.")
     err = state.get("last_error") or {}
     if err and (hours_since(err.get("at")) or 99) < max_h:
         return f"the last sweep crashed: {err.get('error', '')[-300:]}"

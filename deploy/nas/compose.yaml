@@ -34,7 +34,7 @@ services:
       MAX_PER_CYCLE: "8"               # caps Claude usage per cycle
       FIT_THRESHOLD: "70"
       URGENT_SCORE: "85"               # alerts at or above this say "apply today"
-      FOLLOWUP_DAYS: "7"               # nudge + draft follow-up after /applied with no update
+      FOLLOWUP_DAYS: "7"               # nudge + draft follow-up after /jobapplied with no update
       EXTRACT_MODEL: haiku             # reads alert emails; cheap is fine
       STALL_MIN: "120"                 # no progress this long -> the process exits and Docker restarts it
       HEAL: "1"                        # claude -p diagnoses repeated failures and applies safe fixes

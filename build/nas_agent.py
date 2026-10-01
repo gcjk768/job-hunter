@@ -4,25 +4,28 @@
     python build/nas_agent.py --once   # one cycle, then exit
     python build/nas_agent.py --selfcheck   # check every live dependency, print the report, exit
 
-Between cycles it listens to the Telegram chat (TELEGRAM_CHAT_ID only) for commands:
-    /status          health: last cycle, heartbeat, recent runs, errors (no LLM)
-    /ask <question>  ask the model about the jobs it has seen, the drafts, or the system
-    /judge <url> [pasted job text]
-                     judge one posting on demand (MCF links are read via the API; for login-walled
-                     boards like LinkedIn paste the description after the URL) and draft if it fits
-    /sweep           run a cycle now
-    /applied|/interview|/offer|/rejected|/ghosted <ref or free text>
-                     record an outcome; /interview also writes an interview prep pack
-    /pipeline        every tracked application and its status
-    /selfcheck       try every live dependency (Claude, boards, mail, storage) and report ✅/❌
-    /heal            run the self-repair step on the last recorded error
-    /help
-    <a job link>     sharing a link (e.g. from the LinkedIn or JobStreet app) is the same as /judge; if the
-                     page is login-walled the bot asks for the description and judges your next message
+Between cycles it listens to the Telegram chat for commands, only in TELEGRAM_CHAT_ID and, when
+TELEGRAM_THREAD_ID is set, only in that forum topic (the group is shared with other bots). Command names
+are unique /job* ones; the old generic names (/status, /ask, …) are aliases inside the job topic only.
+    /jobstatus          health: last cycle, heartbeat, recent runs, errors (no LLM)
+    /jobask <question>  ask the model about the jobs it has seen, the drafts, or the system
+    /jobjudge <url> [pasted job text]
+                        judge one posting on demand (MCF links are read via the API; for login-walled
+                        boards like LinkedIn paste the description after the URL) and draft if it fits
+    /jobsweep           run a cycle now
+    /jobapplied|/jobinterview|/joboffer|/jobrejected|/jobghosted <ref or free text>
+                        record an outcome; /jobinterview also writes an interview prep pack
+    /jobpipeline        every tracked application and its status
+    /jobselfcheck       try every live dependency (Claude, boards, mail, storage) and report ✅/❌
+    /jobheal            run the self-repair step on the last recorded error
+    /jobhelp
+    <a job link>        sharing a link (e.g. from the LinkedIn or JobStreet app) is the same as /jobjudge;
+                        if the page is login-walled the bot asks for the description and judges your next
+                        message
 
 It can also read job-alert emails (LinkedIn, JobStreet, Glassdoor, Indeed) from your inbox when IMAP_* is
 set (mail_alerts.py), sweeps more often during working hours, drafts a LinkedIn outreach note for each
-fit, reminds you to follow up FOLLOWUP_DAYS after /applied, and posts a weekly digest.
+fit, reminds you to follow up FOLLOWUP_DAYS after /jobapplied, and posts a weekly digest.
 
 Reuses the sweep (weekly_sweep.collect + job_sources) and the document builder (build_docs), so the
 filters in docs/vault/Target Criteria.md and the resume content in build/content.py stay the single
@@ -98,8 +101,8 @@ HEAL_MAX_PER_DAY = int(os.environ.get("HEAL_MAX_PER_DAY", "6"))
 EXIT = os._exit  # replaced in tests; a hard exit so a wedged thread can't keep the process alive
 SLEEP = time.sleep
 PROGRESS = {"t": time.time()}
-OUTCOMES = {"/applied": "applied", "/interview": "interview", "/offer": "offer",
-            "/rejected": "rejected", "/ghosted": "ghosted"}
+OUTCOMES = {"/jobapplied": "applied", "/jobinterview": "interview", "/joboffer": "offer",
+            "/jobrejected": "rejected", "/jobghosted": "ghosted"}
 # ponytail: caps cloud spend per cycle; the rest stay unseen and roll into the next cycle.
 MAX_PER_CYCLE = int(os.environ.get("MAX_PER_CYCLE", "8"))
 FIT_THRESHOLD = int(os.environ.get("FIT_THRESHOLD", "70"))
@@ -391,13 +394,13 @@ def alert_text(r: dict, v: dict, folder: Path, ref: int | None = None) -> str:
         docs.append("⚠️ Not fact-checked (the check failed) — read the letter carefully.")
     docs.append(f"📁 Resume + cover letter: <code>docker/job-hunter/tailored-auto/{esc(folder.name)}/</code>")
     if ref:
-        docs.append(f"🔖 Ref <b>#{ref}</b> — send <code>/applied {ref}</code> once you've applied.")
+        docs.append(f"🔖 Ref <b>#{ref}</b> — send <code>/jobapplied {ref}</code> once you've applied.")
     blocks += ["\n".join(docs), "<i>Nothing was submitted — your call.</i>"]
     return "\n\n".join(blocks)
 
 
 def track(state: dict, key: str, rec: dict, v: dict | None, folder: Path | None, status: str = "drafted") -> int:
-    """Give a posting a short ref number so outcomes can be recorded from Telegram (/applied 12)."""
+    """Give a posting a short ref number so outcomes can be recorded from Telegram (/jobapplied 12)."""
     entry = state["seen"].setdefault(key, {"t": rec["title"], "c": rec["company"], "at": _now()})
     if not entry.get("ref"):
         state["next_ref"] = n = int(state.get("next_ref") or 0) + 1
@@ -821,7 +824,7 @@ def chores(now: dt.datetime | None = None) -> None:
                 telegram(head("followup", f"#{e['ref']}") + "\n\n"
                          f"💼 <b>{esc(e['t'])}</b> · {esc(e['c'])}\n"
                          f"📅 Applied {FOLLOWUP_DAYS}+ days ago, no update\n"
-                         f"👉 Worth a follow-up (or <code>/ghosted {e['ref']}</code>)\n\n"
+                         f"👉 Worth a follow-up (or <code>/jobghosted {e['ref']}</code>)\n\n"
                          + quote("✉️ <b>Draft</b>", esc(draft)))
                 e["followup_sent"] = _now()
                 save_state(state)
@@ -873,7 +876,7 @@ def digest_text(state: dict, now: dt.datetime | None = None) -> str:
         stats.append("🧭 By source: " + esc(", ".join(f"{k} {v[1]}/{v[0]}" for k, v in sorted(by_src.items()))))
     unapplied = [e for e in tracked if e.get("status") == "drafted"]
     if unapplied:
-        stats.append(f"🆕 {len(unapplied)} drafted but not applied — /pipeline to review")
+        stats.append(f"🆕 {len(unapplied)} drafted but not applied — /jobpipeline to review")
     scored = [e for e in applied if e.get("fit") is not None]
     good = [e["fit"] for e in scored if e in replied]
     bad = [e["fit"] for e in scored if e.get("status") in ("rejected", "ghosted")]
@@ -895,16 +898,16 @@ def digest_text(state: dict, now: dt.datetime | None = None) -> str:
 # ---- Telegram commands -------------------------------------------------------------------------
 
 HELP = (head("help", "job watcher") + "\n\n"
-        "🟢 /status · health, last cycle, recent runs\n"
-        "🤔 /ask &lt;question&gt; · ask the model about seen jobs, drafts, or the system\n"
-        "⚖️ /judge &lt;url&gt; [pasted job text] · judge one posting now, draft if it fits\n"
+        "🟢 /jobstatus · health, last cycle, recent runs\n"
+        "🤔 /jobask &lt;question&gt; · ask the model about seen jobs, drafts, or the system\n"
+        "⚖️ /jobjudge &lt;url&gt; [pasted job text] · judge one posting now, draft if it fits\n"
         "🔗 <i>…or just share a job link here (LinkedIn/JobStreet app → Share → Telegram)</i>\n"
-        "🔎 /sweep · run a cycle now\n\n"
-        "✅ /applied, /interview, /offer, /rejected, /ghosted &lt;ref or text&gt; · record an outcome "
-        "(/interview also builds a prep pack)\n"
-        "🗂 /pipeline · tracked applications\n\n"
-        "🩺 /selfcheck · test Claude, the job boards, mail and storage for real\n"
-        "🩹 /heal · diagnose the last error and apply safe fixes\n\n"
+        "🔎 /jobsweep · run a cycle now\n\n"
+        "✅ /jobapplied, /jobinterview, /joboffer, /jobrejected, /jobghosted &lt;ref or text&gt; · record an outcome "
+        "(/jobinterview also builds a prep pack)\n"
+        "🗂 /jobpipeline · tracked applications\n\n"
+        "🩺 /jobselfcheck · test Claude, the job boards, mail and storage for real\n"
+        "🩹 /jobheal · diagnose the last error and apply safe fixes\n\n"
         "<i>Nothing here ever applies anywhere.</i>")
 ASK_PROMPT = """You are the assistant inside James's self-hosted job watcher (a Docker container on his NAS).
 Answer his question briefly and concretely, in plain text (no markdown tables), from the context below.
@@ -1013,7 +1016,7 @@ class Unreadable(ValueError):
 
 
 def posting_from(arg: str) -> dict:
-    """Turn '/judge <url> [pasted text]' into a record judge() understands."""
+    """Turn '/jobjudge <url> [pasted text]' into a record judge() understands."""
     url, _, pasted = arg.strip().partition(" ")
     if not url.startswith("http"):
         url, pasted = "", arg.strip()
@@ -1070,7 +1073,7 @@ PENDING_H = 2  # how long the bot waits for a pasted description after asking fo
 
 
 def shared(text: str, thread) -> None:
-    """A plain message: job links are judged like /judge; a long text right after the bot asked for a
+    """A plain message: job links are judged like /jobjudge; a long text right after the bot asked for a
     description is judged against the link it asked about. Anything else is ignored (it's a chat)."""
     state = load_state()
     pending = state.get("pending_judge") or {}
@@ -1110,13 +1113,37 @@ def usage(text: str) -> str:
     return f"{head('usage')}\n\n<i>Usage: {text}</i>"
 
 
+# Unique names: the James Channel group is shared by ~10 bots and Telegram has no per-topic command menu,
+# so /status, /help and /ask belong to other bots. The old generic names still work inside the job topic.
+COMMANDS = ("/jobhelp", "/jobstatus", "/jobask", "/jobjudge", "/jobapplied", "/jobinterview", "/joboffer",
+            "/jobrejected", "/jobghosted", "/jobpipeline", "/jobselfcheck", "/jobheal", "/jobsweep")
+ALIASES = {"/" + c[4:]: c for c in COMMANDS} | {"/start": "/jobhelp"}
+
+
+def in_topic(msg: dict) -> bool:
+    """True for messages in TELEGRAM_CHAT_ID and, when TELEGRAM_THREAD_ID is set, only in that forum topic.
+    Every bot in the group receives every message, so anything from another topic is someone else's."""
+    if str(msg.get("chat", {}).get("id")) != str(os.environ.get("TELEGRAM_CHAT_ID")):
+        return False
+    topic = os.environ.get("TELEGRAM_THREAD_ID")
+    return not topic or str(msg.get("message_thread_id")) == str(topic)
+
+
 def poll_commands(state: dict, wait: int) -> bool:
-    """Long-poll Telegram for up to `wait` seconds and handle commands. Returns True when /sweep asked for
-    a cycle now. Only messages from TELEGRAM_CHAT_ID are answered; everyone else is ignored."""
+    """Long-poll Telegram for up to `wait` seconds and handle commands. Returns True when /jobsweep asked for
+    a cycle now. Only messages in TELEGRAM_CHAT_ID's job topic are answered (in_topic); the rest is ignored."""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (token and chat):
         time.sleep(wait)
         return False
+    if not state.get("tg_offset"):  # first start: skip the backlog rather than replay old commands
+        try:
+            apply_remedy("reset_telegram_offset")
+        except Exception as exc:  # retried on the next poll; never read the backlog instead
+            print(f"  ! skipping the Telegram backlog failed: {exc}")
+            time.sleep(min(wait, 60))
+            return False
+        state = load_state()
     q = urllib.parse.urlencode({"timeout": wait, "offset": state.get("tg_offset", 0),
                                 "allowed_updates": json.dumps(["message"])})
     try:
@@ -1130,33 +1157,34 @@ def poll_commands(state: dict, wait: int) -> bool:
     sweep_now = False
     for u in updates:
         # Persist first, so a crash on one message never replays it forever. Re-read rather than reuse
-        # `state`: a previous command (/judge) may have written the file since.
+        # `state`: a previous command (/jobjudge) may have written the file since.
         fresh = load_state()
         fresh["tg_offset"] = u["update_id"] + 1
         save_state(fresh)
         msg = u.get("message") or {}
         text = (msg.get("text") or "").strip()
-        if str(msg.get("chat", {}).get("id")) != str(chat) or not text:
+        if not in_topic(msg) or not text:
             continue
         if not text.startswith("/"):
             shared(text, msg.get("message_thread_id"))
             continue
         cmd, _, arg = text.partition(" ")
-        cmd = cmd.split("@")[0].lower()  # /ask@JobHunterBot in groups
+        cmd = cmd.split("@")[0].lower()  # /jobask@JobHunterBot in groups
+        cmd = ALIASES.get(cmd, cmd)  # in_topic() already limited this to the job topic
         thread = msg.get("message_thread_id")
         try:
-            if cmd in ("/help", "/start"):
+            if cmd in ("/jobhelp", "/start"):
                 telegram(HELP, thread)
-            elif cmd == "/status":
+            elif cmd == "/jobstatus":
                 telegram(status_text(load_state()), thread)
-            elif cmd == "/ask":
+            elif cmd == "/jobask":
                 if not arg.strip():
-                    telegram(usage("/ask &lt;question&gt;, e.g. /ask which of this week's roles fit best?"), thread)
+                    telegram(usage("/jobask &lt;question&gt;, e.g. /jobask which of this week's roles fit best?"), thread)
                 else:
                     telegram(f"{head('ask', arg.strip()[:60])}\n\n{esc(ask(arg.strip()))}", thread)
-            elif cmd == "/judge":
+            elif cmd == "/jobjudge":
                 if not arg.strip():
-                    telegram(usage("/judge &lt;url&gt; [pasted job description]"), thread)
+                    telegram(usage("/jobjudge &lt;url&gt; [pasted job description]"), thread)
                 else:
                     telegram(head("working", "reading and judging…"), thread)
                     telegram(judge_command(arg), thread)
@@ -1168,21 +1196,21 @@ def poll_commands(state: dict, wait: int) -> bool:
                     if OUTCOMES[cmd] == "interview":
                         telegram(head("working", "building the interview prep pack…"), thread)
                         telegram(prep_pack(arg.strip()), thread)
-            elif cmd == "/heal":
+            elif cmd == "/jobheal":
                 err = (load_state().get("last_error") or {}).get("error") or arg.strip()
                 if not err:
                     telegram(f"{head('heal', 'nothing to heal')}\n\n<i>No recorded error. Send "
-                             f"/heal &lt;what's wrong&gt; to describe one.</i>", thread)
-                elif not heal("manual /heal", err, force=True, thread=thread):
+                             f"/jobheal &lt;what's wrong&gt; to describe one.</i>", thread)
+                elif not heal("manual /jobheal", err, force=True, thread=thread):
                     telegram(f"{head('heal', 'not run')}\n\n<i>Self-heal is off or over today's limit "
                              f"(<code>HEAL</code>, <code>HEAL_MAX_PER_DAY</code>).</i>", thread)
-            elif cmd == "/selfcheck":
+            elif cmd == "/jobselfcheck":
                 telegram(head("working", "running the self-check (about 30s)…"), thread)
                 telegram(selfcheck(), thread)
-            elif cmd == "/pipeline":
+            elif cmd == "/jobpipeline":
                 rows = pipeline_text(load_state())
                 telegram(f"{head('pipeline', 'tracked applications')}\n\n{rows or '<i>Nothing tracked yet.</i>'}", thread)
-            elif cmd == "/sweep":
+            elif cmd == "/jobsweep":
                 telegram(head("working", "running a sweep now…"), thread)
                 sweep_now = True
         except Exception as exc:
@@ -1316,7 +1344,7 @@ def main() -> None:
         start_watchdog()
         guarded(startup_checks)
     # A container restart (NAS reboot, image update, crash) must not trigger a full paid sweep each
-    # time; resume the schedule from the last finished cycle instead. /sweep still forces one.
+    # time; resume the schedule from the last finished cycle instead. /jobsweep still forces one.
     wait = 0.0 if once else due_in(load_state())
     if wait:
         print(f"[{dt.datetime.now():%F %T}] last cycle is recent; next one in {wait / 3600:.1f}h")
@@ -1324,7 +1352,7 @@ def main() -> None:
     while True:
         if not guarded(cycle):
             try:
-                telegram(head("error", "sweep failed") + "\n\n<i>See /status (self-heal is looking at it).</i>")
+                telegram(head("error", "sweep failed") + "\n\n<i>See /jobstatus (self-heal is looking at it).</i>")
             except Exception:
                 pass
         if once:
@@ -1518,7 +1546,7 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
         last = error.strip().splitlines()[-1][:300] if error.strip() else ""
         _say(f"{head('heal', trigger)}\n\n"
              f"🔴 Couldn't reach Claude to diagnose\n🧾 <code>{esc(type(exc).__name__)}: {esc(str(exc)[:150])}</code>\n"
-             f"💥 Failure: <code>{esc(last)}</code>\n\n<i>Try /selfcheck.</i>", thread)
+             f"💥 Failure: <code>{esc(last)}</code>\n\n<i>Try /jobselfcheck.</i>", thread)
         return True
 
     done, restart = [], False
@@ -1571,8 +1599,9 @@ def apply_remedy(action: str) -> bool:
         with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1&timeout=0",
                                     timeout=30) as r:
             last = json.load(r).get("result") or []
-        if last:
-            state["tg_offset"] = last[-1]["update_id"] + 1
+        # offset=-1 returns only the newest update and confirms the rest; start after it. An empty queue
+        # still stores an offset, so a first start doesn't repeat this on every poll.
+        state["tg_offset"] = last[-1]["update_id"] + 1 if last else 1
     elif action == "clear_retry_counters":
         state["attempts"] = {}
     elif action == "skip_failing_postings":

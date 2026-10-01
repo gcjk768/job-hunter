@@ -10,6 +10,7 @@ import email.message
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -55,8 +56,8 @@ def fake_urlopen(req, data=None, timeout=0):
     if "sendMessage" in url:
         SENT.append(urllib.parse.unquote_plus(data.decode()))
         return Resp(b"{}")
-    if "getUpdates" in url:
-        out, UPDATES[:] = list(UPDATES), []
+    if "getUpdates" in url:  # offset=-1 (skip the backlog) returns only the newest and confirms the rest
+        out, UPDATES[:] = (UPDATES[-1:] if "offset=-1" in url else list(UPDATES)), []
         return Resp(json.dumps({"result": out}).encode())
     if "mycareersfuture" in url and url.rstrip("/").endswith("a" * 32):
         return Resp(json.dumps({"title": "Platform Engineer", "hiringCompany": {"name": "Acme"},
@@ -83,7 +84,7 @@ CALLS: list[list[str]] = []
 
 
 def fake_run(cmd, input=None, cwd=None, **kw):
-    """Stands in for the claude CLI: --version, a schema'd judge call, or a plain /ask."""
+    """Stands in for the claude CLI: --version, a schema'd judge call, or a plain /jobask."""
     CALLS.append(cmd)
     if cmd[1:] == ["--version"]:
         return subprocess.CompletedProcess(cmd, 0, "2.1.0 (Claude Code)", "")
@@ -194,23 +195,47 @@ check("due_in: overdue -> now",
 
 # --- Telegram commands ----------------------------------------------------------------------------
 SENT.clear()
-UPDATES[:] = [msg(5, "/status", thread=7), msg(6, "/status", chat=99), msg(7, "/ask@JobBot which fits best?"),
-              msg(8, "/judge https://www.mycareersfuture.gov.sg/job/x-" + "a" * 32),
-              msg(9, "/judge https://example.com/job/1"), msg(10, "/sweep")]
-check("/sweep asks for a cycle", a.poll_commands(a.load_state(), 1) is True)
+UPDATES[:] = [msg(1, "/jobstatus"), msg(2, "/jobsweep"), msg(3, "/jobask old question")]
+check("a first start with no stored offset skips the backlog",
+      "tg_offset" not in a.load_state() and a.poll_commands(a.load_state(), 1) is False and not SENT
+      and a.load_state()["tg_offset"] == 4)
+UPDATES[:] = [msg(5, "/jobstatus", thread=7), msg(6, "/jobstatus", chat=99), msg(7, "/jobask@JobBot which fits best?"),
+              msg(8, "/jobjudge https://www.mycareersfuture.gov.sg/job/x-" + "a" * 32),
+              msg(9, "/jobjudge https://example.com/job/1"), msg(10, "/jobsweep")]
+check("/jobsweep asks for a cycle", a.poll_commands(a.load_state(), 1) is True)
 check("update offset persisted", a.load_state()["tg_offset"] == 11)
-check("/status answers in the asking topic", "message_thread_id=7" in SENT[0] and "Heartbeat" in SENT[0])
-check("/status shows the claude CLI version", "2.1.0 (Claude Code)" in SENT[0])
+check("/jobstatus answers in the asking topic", "message_thread_id=7" in SENT[0] and "Heartbeat" in SENT[0])
+check("/jobstatus shows the claude CLI version", "2.1.0 (Claude Code)" in SENT[0])
 check("strangers are ignored", sum("Heartbeat" in s for s in SENT) == 1)
-check("/ask returns the model's answer", any("Role X fits best." in s for s in SENT))
-check("/judge reads MCF via the API", any("Platform Engineer" in s and "$9,000" in s for s in SENT))
-check("/judge reads a plain page", any("SRE at Example" in s for s in SENT))
-check("/judge records the posting as seen", "a" * 32 in a.load_state()["seen"])
+check("/jobask returns the model's answer", any("Role X fits best." in s for s in SENT))
+check("/jobjudge reads MCF via the API", any("Platform Engineer" in s and "$9,000" in s for s in SENT))
+check("/jobjudge reads a plain page", any("SRE at Example" in s for s in SENT))
+check("/jobjudge records the posting as seen", "a" * 32 in a.load_state()["seen"])
+
+# Topic filter: the group is shared by ~10 bots, so only the job topic (TELEGRAM_THREAD_ID) is ours.
+os.environ["TELEGRAM_THREAD_ID"] = "2574"
+SENT.clear()
+UPDATES[:] = [msg(30, "/jobask which fits best?", thread=2574), msg(31, "/ask which fits best?", thread=2763),
+              msg(32, "/jobask which fits best?", thread=2763), msg(33, "/status", thread=3038),
+              msg(34, "/jobstatus"), msg(35, "https://example.com/job/1", thread=2763)]
+a.poll_commands(a.load_state(), 1)
+check("/jobask in the job topic is answered there",
+      len(SENT) == 1 and "Role X fits best." in SENT[0] and "message_thread_id=2574" in SENT[0])
+check("/ask, /jobask and /status in other topics (or none) are ignored, links too", len(SENT) == 1)
+SENT.clear()
+UPDATES[:] = [msg(40, "/status", thread=2574), msg(41, "/ask which fits best?", thread=2574),
+              msg(42, "/help", thread=2574)]
+a.poll_commands(a.load_state(), 1)
+check("old names still work as aliases inside the job topic",
+      len(SENT) == 3 and "Heartbeat" in SENT[0] and "Role X fits best." in SENT[1] and "COMMANDS</b>" in SENT[2])
+check("/jobhelp lists only /job* commands", all(c in a.HELP for c in a.COMMANDS if c != "/jobhelp")
+      and not re.search(r"(?<![\w/])/(status|ask|help|pipeline|applied|selfcheck)\b", a.HELP))
+os.environ.pop("TELEGRAM_THREAD_ID")
 try:
     a.posting_from("https://example.com/job/1 short")
-    check("/judge with short pasted text falls back to the page", True)
+    check("/jobjudge with short pasted text falls back to the page", True)
 except ValueError:
-    check("/judge with short pasted text falls back to the page", False)
+    check("/jobjudge with short pasted text falls back to the page", False)
 
 # --- alerts: urgency, outreach, refs --------------------------------------------------------------
 SENT.clear()
@@ -222,13 +247,13 @@ check("alert carries who to reach, a people-search link and the note",
       "Reach out to:</b> Head of Platform" in alert and "linkedin.com/search/results/people" in alert
       and "Checked note." in alert)
 ref10 = a.load_state()["seen"]["j10"]["ref"]
-check("fits get a ref number in the alert", f"/applied {ref10}" in alert)
+check("fits get a ref number in the alert", f"/jobapplied {ref10}" in alert)
 check("the fact-check's corrections reach the alert", "1 claim corrected" in alert and "Checked note." in alert)
 check("pay reads as a clean range", a.pay_text({"lo": 11000, "hi": 14000}) == "$11,000–14,000/mo"
       and a.pay_text({"lo": 9500}) == "from $9,500/mo" and a.pay_text({"lo": None}) == "pay not published")
 check("ages never go negative and switch to days", a._age((dt.datetime.now() + dt.timedelta(hours=3)).isoformat())
       == "just now" and a._age((dt.datetime.now() - dt.timedelta(days=5)).isoformat()) == "5d ago")
-check("/status shows the interval in force now", f"every {a.interval_now():g}h now" in a.status_text({}))
+check("/jobstatus shows the interval in force now", f"every {a.interval_now():g}h now" in a.status_text({}))
 
 v = a.factcheck(rec("x"), VERDICT)
 check("fact-check replaces the drafts with the checked text", v["letter"] == ["checked p1", "checked p2"]
@@ -268,16 +293,16 @@ check("the draft folder gets outreach.md", "Head of Platform" in (folder / "outr
 
 # --- outcome tracking -----------------------------------------------------------------------------
 SENT.clear()
-UPDATES[:] = [msg(20, f"/applied {ref10}"), msg(21, "/applied Staff SRE at Initech"), msg(22, "/pipeline"),
-              msg(23, f"/interview #{ref10}")]
+UPDATES[:] = [msg(20, f"/jobapplied {ref10}"), msg(21, "/jobapplied Staff SRE at Initech"), msg(22, "/jobpipeline"),
+              msg(23, f"/jobinterview #{ref10}")]
 a.poll_commands(a.load_state(), 1)
 st = a.load_state()
 e10 = st["seen"]["j10"]
-check("/applied records status and date", e10["status"] == "interview" and e10.get("applied_at"))
-check("/applied with free text tracks a manual entry",
+check("/jobapplied records status and date", e10["status"] == "interview" and e10.get("applied_at"))
+check("/jobapplied with free text tracks a manual entry",
       any(e.get("source") == "manual" and e["c"] == "Initech" for e in st["seen"].values()))
-check("/pipeline lists tracked applications", any("Initech" in s and f"#{ref10}" in s for s in SENT))
-check("/interview replies with a prep pack", any("📚 <b>PREP PACK</b>" in s and "LIKELY QUESTIONS" in s for s in SENT))
+check("/jobpipeline lists tracked applications", any("Initech" in s and f"#{ref10}" in s for s in SENT))
+check("/jobinterview replies with a prep pack", any("📚 <b>PREP PACK</b>" in s and "LIKELY QUESTIONS" in s for s in SENT))
 check("history keeps every status change", [h[0] for h in e10["history"]] == ["drafted", "applied", "interview"])
 
 st["seen"]["old-tracked"] = {"t": "x", "c": "y", "at": "2000-01-01T00:00:00", "ref": 999}
@@ -321,7 +346,7 @@ for i in range(a.BACKUP_DAYS + 5):
     a.backup_state(monday10 - dt.timedelta(days=i))
 check("only the last BACKUP_DAYS backups are kept",
       len(list((a.STATE.parent / "backups").glob("nas_state-*.json"))) == a.BACKUP_DAYS)
-check("/status shows the deployed commit", "@" in a.code_version() or "copied files" in a.code_version())
+check("/jobstatus shows the deployed commit", "@" in a.code_version() or "copied files" in a.code_version())
 check("a failing follow-up draft still nudges, once, without retrying every loop",
       sum("⏰" in s for s in SENT) == 1 and any("couldn't draft one" in s for s in SENT))
 
@@ -447,20 +472,20 @@ saved_user = os.environ.pop("IMAP_USER")
 check("the email check is hidden when email isn't set up", "Alert emails" not in a.selfcheck())
 os.environ["IMAP_USER"] = saved_user
 
-# --- /selfcheck -----------------------------------------------------------------------------------
+# --- /jobselfcheck -----------------------------------------------------------------------------------
 a.mail_alerts.fetch = lambda done: real_fetch(done, imap_factory=FakeIMAP)
 SENT.clear()
-UPDATES[:] = [msg(40, "/selfcheck")]
+UPDATES[:] = [msg(40, "/jobselfcheck")]
 a.poll_commands(a.load_state(), 1)
 report = next((s for s in SENT if "🩺 <b>SELF-CHECK</b>" in s), "")
-check("/selfcheck reports Claude, MCF and each board",
+check("/jobselfcheck reports Claude, MCF and each board",
       "✅ <b>Claude</b>" in report and "✅ <b>MyCareersFuture</b> · 2 results" in report
       and "✅ <b>Greenhouse" in report and "description 17 chars" in report and "✅ <b>Ashby" in report)
-check("/selfcheck marks an empty board as reachable, not failed", "⚪ <b>Lever" in report and "no open roles" in report)
-check("/selfcheck logs in to the mailbox", "✅ <b>Alert emails</b> · logged in, 1 alert email(s)" in report)
-check("/selfcheck warns when the example resume/profile are loaded", "❌ <b>Private files</b>" in report
+check("/jobselfcheck marks an empty board as reachable, not failed", "⚪ <b>Lever" in report and "no open roles" in report)
+check("/jobselfcheck logs in to the mailbox", "✅ <b>Alert emails</b> · logged in, 1 alert email(s)" in report)
+check("/jobselfcheck warns when the example resume/profile are loaded", "❌ <b>Private files</b>" in report
       and "EXAMPLE resume" in report)
-check("/selfcheck checks storage and counts problems", "✅ <b>Storage</b> · writable" in report and "problem(s) above" in report)
+check("/jobselfcheck checks storage and counts problems", "✅ <b>Storage</b> · writable" in report and "problem(s) above" in report)
 real_urlopen = a.urllib.request.urlopen
 a.urllib.request.urlopen = lambda req, *x, **k: fake_urlopen(req, *x, **k) if "telegram" in str(
     getattr(req, "full_url", req)) else (_ for _ in ()).throw(OSError("network down"))
@@ -625,7 +650,7 @@ check("heal() applies the chosen safe remedies", st["attempts"] == {} and a.back
 patches = list((a.STATE.parent / "patches").glob("*.diff"))
 check("a proposed code fix is saved, not applied", len(patches) == 1 and any("NOT applied" in s for s in SENT))
 check("the same failure isn't diagnosed twice in 6h", a.heal("sweep raised", err) is False)
-check("…unless forced (/heal)", a.heal("sweep raised", err, force=True) is True)
+check("…unless forced (/jobheal)", a.heal("sweep raised", err, force=True) is True)
 os.environ["IMAP_USER"] = "me@gmail.com"
 check("a paused mail reader reads nothing", a.mail_jobs(a.load_state()) == [])
 os.environ.pop("IMAP_USER")
@@ -670,9 +695,9 @@ st["heals"] = []
 a.save_state(st)
 HEAL_REPLY.update(actions=["none"])
 SENT.clear()
-UPDATES[:] = [msg(800, "/heal")]
+UPDATES[:] = [msg(800, "/jobheal")]
 a.poll_commands(a.load_state(), 1)
-check("/heal diagnoses the last recorded error", any("🩹 <b>SELF-HEAL</b> · manual /heal" in s for s in SENT))
+check("/jobheal diagnoses the last recorded error", any("🩹 <b>SELF-HEAL</b> · manual /jobheal" in s for s in SENT))
 real_tg = a.telegram
 a.telegram = lambda *x, **k: (_ for _ in ()).throw(OSError("telegram down"))
 try:
@@ -696,7 +721,7 @@ check("watchdog: alive but sweeps stuck", "last finished sweep" in (watchdog.pro
 check("watchdog: missing file", "not found" in (watchdog.problem(TMP / "nope.json", 2, 6) or ""))
 
 # --- Telegram HTML: escaping, block-safe chunks, plain-text fallback --------------------------------
-import re  # noqa: E402
+
 import urllib.error  # noqa: E402
 
 import tg  # noqa: E402
@@ -751,10 +776,10 @@ a.urllib.request.urlopen = fake_urlopen
 SENT.clear()
 a.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, json.dumps(
     {"subtype": "success", "is_error": False, "result": "Use <kubectl> & helm"}), "")
-UPDATES[:] = [msg(900, "/ask what <tools>?")]
+UPDATES[:] = [msg(900, "/jobask what <tools>?")]
 a.poll_commands(a.load_state(), 1)
 a.subprocess.run = fake_run
-check("/ask escapes the model's answer and the question",
+check("/jobask escapes the model's answer and the question",
       any("Use &lt;kubectl&gt; &amp; helm" in s and "what &lt;tools&gt;?" in s for s in SENT))
 a.urllib.request.urlopen = lambda req, *x, **k: Resp(json.dumps(
     {"jobPostingInfo": {"jobDescription": "<p>Run &amp; scale K8s</p>"}}).encode())
