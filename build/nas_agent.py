@@ -393,7 +393,7 @@ def archive(e: dict) -> None:
 
 def pay_of(r: dict) -> str:
     if r.get("lo") is not None:
-        return f"${r['lo']:,}–{r.get('hi') or '?'}/mo"
+        return f"${r['lo']:,}–{f'{r["hi"]:,}' if r.get('hi') else '?'}/mo"
     est = pay_estimate(r["title"])
     return f"pay not published (est. {est})" if est else "pay not published"
 
@@ -521,7 +521,8 @@ def cycle(state: dict) -> None:
         save(state)
 
 
-def digest(state: dict) -> str:
+def digest(state: dict) -> list[str]:
+    """Telegram messages: a summary, one card per fit (each job its own message), then the not-a-fit list."""
     log, day, skips = today_log(state), str(dt.date.today()), skip_patterns()
     # Only postings still on the boards, and never ones already applied to / rejected.
     judged = sorted((e for e in state["seen"].values() if e.get("d") == day and not e.get("closed")
@@ -535,20 +536,19 @@ def digest(state: dict) -> str:
     if log["error"]:
         lines.append(f"⚠️ {log['failed']} judge failures (retried next sweep). "
                      f"Last error: {html.escape(str(log['error']))}")
-    lines += ["\n" + card(e) for e in fits]
-    rest = [e for e in judged if not e.get("suitable")]
-    if rest:
-        lines.append("\n<b>Not a fit</b>")
-        lines += [f"{e.get('fit')} · {html.escape(label(e))}" for e in rest]
     if not judged:
         lines.append("Nothing new today.")
-    text = "\n".join(lines)
+    msgs = ["\n".join(lines)] + [card(e) for e in fits]
+    rest = [e for e in judged if not e.get("suitable")]
+    if rest:
+        msgs.append("\n".join(["<b>Not a fit</b>"] + [f"{e.get('fit')} · {html.escape(label(e))}" for e in rest]))
+    text = "\n\n".join(msgs)
     plain = html.unescape(re.sub(r"<[^>]+>", "", text))  # the vault note is Markdown, not Telegram HTML
     daily = VAULT / "Daily" / f"{day}.md"
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(f"---\ntags: [digest]\ndate: {day}\n---\n\n{plain}\n\n## Notes\n"
                      + "".join(f"- [[{e['note']}]]\n" for e in judged if e.get("note")), encoding="utf-8")
-    return text
+    return msgs
 
 
 def rejudge(state: dict, n: int) -> None:
@@ -604,7 +604,7 @@ def weekly(state: dict) -> str:
     lines = [f"🗓 Week to {today} — {len(week)} new postings judged, {len(fits)} fit, {closed} already off the boards."]
     if fits:
         lines.append("\nFits this week:")
-        lines += [f"· {e['fit']} {e['t']} — {e['c'].title()} [{e.get('status') or ('closed' if e.get('closed') else 'open')}]"
+        lines += [f"· {e['fit']} {label(e)} [{e.get('status') or ('closed' if e.get('closed') else 'open')}]"
                   for e in fits]
     if top:
         lines.append("\nMost active employers: " + ", ".join(f"{c} ({n})" for c, n in top))
@@ -631,7 +631,8 @@ def write_status(state: dict) -> None:
 
 def main() -> None:
     if "--digest" in sys.argv:
-        telegram(digest(load()), rich=True)
+        for m in digest(load()):
+            telegram(m, rich=True)
         return
     once = "--once" in sys.argv
     code = lambda: {f: f.stat().st_mtime for f in Path(__file__).parent.glob("*.py")}  # noqa: E731
@@ -663,7 +664,8 @@ def main() -> None:
         today = str(dt.date.today())
         if dt.datetime.now().hour >= DIGEST_HOUR and state.get("digest_on") != today:
             try:
-                telegram(digest(state), rich=True)
+                for m in digest(state):
+                    telegram(m, rich=True)
                 if dt.date.today().weekday() == 6:  # Sunday
                     telegram(weekly(state))
                 state["digest_on"] = today

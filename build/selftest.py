@@ -98,7 +98,9 @@ def nas_watcher() -> str:
     a.cycle(state)
     if sum("failed in a row" in m for m in sent) != 1:
         return "no single failure alert after repeated judge errors"
-    a.digest(state)
+    msgs = a.digest(state)
+    if not isinstance(msgs, list) or sum(m.startswith("✅") for m in msgs) != 2 or any(m.count("Open posting") > 1 for m in msgs):
+        return f"digest should send one message per fit job, got {len(msgs)} messages"
     if not (a.VAULT / "Daily" / f"{today}.md").exists():
         return "daily digest note missing"
     if a.dupe_key("Solutions Architect, AWS SGP", "Amazon / AWS") != \
@@ -114,7 +116,7 @@ def nas_watcher() -> str:
     a.cycle(state)
     if not state["seen"]["1"].get("closed") or not list((a.VAULT / "Archive").glob("*.md")):
         return "closed posting not archived"
-    if "Senior SRE" in a.digest(state):
+    if "Senior SRE" in "\n".join(a.digest(state)):
         return "closed posting still in the digest"
     # Tracker rows marked applied feed the skip list with no manual step.
     a.TRACKER = tmp / "tracker.md"
