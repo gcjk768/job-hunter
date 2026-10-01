@@ -116,6 +116,8 @@ Environment (put the secrets in `.env`, which is never committed):
 | `STALL_MIN` | `120` | Minutes without loop progress before the process restarts itself |
 | `HEAL` | `1` | `0` turns off the `claude -p` self-repair step |
 | `HEAL_MAX_PER_DAY` | `6` | Cap on self-repair diagnoses per day |
+| `VAULT_DIR` | unset (compose: `/vault`) | Obsidian vault the agent writes and reads back as memory (see below); unset turns it off |
+| `VAULT_UID` | `1000` | Owner given to vault files when the container runs as root, so you can edit them |
 
 ### Telegram commands
 
@@ -126,7 +128,7 @@ Commands are prefixed `/job` so they never collide with other bots in a shared g
 | Command | What it does |
 |---|---|
 | `/jobstatus` | Heartbeat, last cycle, `claude` CLI version, last 5 runs with cost, last error. No LLM call. |
-| `/jobask <question>` | Asks the model, with the recently judged postings, recent drafts and system status as context. |
+| `/jobask <question>` | Asks the model, with the recently judged postings, recent drafts, system status and the vault memory (notes on companies you name) as context. |
 | `/jobjudge <url> [pasted text]` | Judges one posting on demand and drafts the resume + cover letter if it fits. MyCareersFuture links are read through the API; for login-walled boards (LinkedIn etc.) paste the job description after the URL. |
 | `/jobapplied`, `/jobinterview`, `/joboffer`, `/jobrejected`, `/jobghosted` `<ref or text>` | Records an outcome for the alert with that ref, or for "Role at Company" you found elsewhere. `/jobinterview` also replies with an interview prep pack (saved as `prep.md`). |
 | `/jobpipeline` | Every tracked application and its status. |
@@ -137,6 +139,13 @@ Commands are prefixed `/job` so they never collide with other bots in a shared g
 | `/jobhelp` | Lists the commands. |
 
 Only one process may call `getUpdates` per bot token, so nothing else should poll this bot.
+
+### Vault: movement log + memory
+
+With `VAULT_DIR` set (compose mounts `/volume1/James/Obsidian/Job Hunter` at `/vault`), `build/vault.py` keeps an Obsidian vault:
+`Home.md` (the pipeline at a glance), `Activity/YYYY-MM-DD.md` (one line per event, SGT: `- HH:MM emoji **what** · detail · [[entity]]` for sweeps, fit alerts, not-a-fits, outcomes, commands, self-heal), `Jobs/Company — Title.md` (fit, why, gaps, link, status in frontmatter, append-only `## History`) and `Companies/Company.md` (its postings and outcomes).
+
+It is read back as memory: the judge and `/jobask` prompts get a capped excerpt (about 4,000 chars: the job and company notes, then the recent log, newest first), so the model knows you already applied, were rejected or were ghosted; and a posting whose note shows it was already alerted or acted on is never judged or alerted again, even after the state file forgets it. Vault I/O is best-effort and never breaks a run or costs an alert. No secrets or prompts are written; files are mode 664, owned by `VAULT_UID`.
 
 ### Health
 

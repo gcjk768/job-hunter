@@ -21,6 +21,7 @@
 !/build/watchdog.py
 !/build/mail_alerts.py
 !/build/tg.py
+!/build/vault.py
 
 /deploy/*
 !/deploy/nas/

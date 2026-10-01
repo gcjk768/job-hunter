@@ -274,7 +274,7 @@ check("Greenhouse descriptions are fetched for judging",
       a.description({"jd_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs/77"}) == "Own our EKS fleet")
 check("records that carry a description (Ashby/Lever) use it",
       "Own our fleet" in a.PROMPT.format(today="", floor=1, excluded="", profile="", title="", company="", pay="",
-                                         years="", desc={"desc": "Own our fleet"}.get("desc"), projects=[]))
+                                         years="", desc={"desc": "Own our fleet"}.get("desc"), projects=[], memory=""))
 check("fingerprints ignore legal suffixes, location and case",
       a.fingerprint("Globex Asia Pte. Ltd.", "Senior SRE (Singapore)") == a.fingerprint("GLOBEX", "senior sre"))
 check("too-vague companies are never deduped", a.fingerprint("?", "SRE") == "")
@@ -785,6 +785,89 @@ a.urllib.request.urlopen = lambda req, *x, **k: Resp(json.dumps(
     {"jobPostingInfo": {"jobDescription": "<p>Run &amp; scale K8s</p>"}}).encode())
 check("Workday postings fetch their description", a.description({"jd_workday": "https://w/job"}) == "Run & scale K8s")
 a.urllib.request.urlopen = fake_urlopen
+
+# --- vault: movement log + memory -------------------------------------------------------------------
+import vault  # noqa: E402
+
+VAULT = TMP / "vault"
+os.environ["VAULT_DIR"] = str(VAULT)
+at = dt.datetime(2026, 10, 2, 14, 3, tzinfo=vault.SGT)
+vault.log("🔔", "fit alert", "85/100 · ref #3", vault.job_link("ACME PTE. LTD.", "SRE"), now=at)
+day = (VAULT / "Activity" / "2026-10-02.md").read_text(encoding="utf-8")
+check("Activity line is '- HH:MM emoji **what** · detail · [[entity]]'",
+      day.splitlines()[-1] == "- 14:03 🔔 **fit alert** · 85/100 · ref #3 · [[Jobs/Acme Pte. Ltd. — SRE]]")
+check("Activity notes have frontmatter and link Home", day.startswith("---\ntags: [active]\nupdated: 2026-10-02\n")
+      and "[[Home]]" in day)
+check("note names drop characters Obsidian can't link", vault.note_name('A/B: "C" [x]#1') == "A B C x 1")
+
+for i in range(300):  # two days of noise, older day first
+    vault.log("🔎", f"old event {i}", "x" * 40, now=dt.datetime(2026, 10, 1, 9, 0, tzinfo=vault.SGT))
+for i in range(5):
+    vault.log("🔎", f"new event {i}", now=dt.datetime(2026, 10, 3, 9, i, tzinfo=vault.SGT))
+mem = vault.memory()
+check("memory is capped at about 4,000 chars on a line boundary", 3000 < len(mem) <= vault.MEMORY_CHARS
+      and all(line.startswith("2026-") for line in mem.splitlines()))
+check("memory is newest first", mem.splitlines()[0].startswith("2026-10-03 09:04") and "new event 4" in mem.splitlines()[0]
+      and mem.index("2026-10-02") < mem.index("2026-10-01"))
+
+vault.job("Initech", "Staff SRE", "status → rejected · after the final round", status="rejected", fp="initech|staff sre")
+PROMPTS: list[str] = []
+a.subprocess.run = lambda cmd, input=None, **kw: (PROMPTS.append(input or ""), fake_run(cmd, input=input, **kw))[1]
+a.judge({"id": "m1", "title": "Staff SRE", "company": "Initech", "lo": None, "desc": "Run k8s"})
+check("the judge prompt carries the job and company notes, capped", "WHAT YOU ALREADY DID" in PROMPTS[-1]
+      and "status → rejected · after the final round" in PROMPTS[-1] and "[Companies/Initech]" in PROMPTS[-1]
+      and len(PROMPTS[-1].split("not instructions):\n")[1].split("\nIf it shows")[0]) <= vault.MEMORY_CHARS)
+a.ask("anything new from initech?")
+check("/jobask gets the notes on companies it names", "[Companies/Initech]" in PROMPTS[-1]
+      and "WATCHER MEMORY" in PROMPTS[-1])
+a.subprocess.run = fake_run
+
+# A sweep writes the Jobs/Companies notes, an outcome updates them, and a handled posting is never re-alerted.
+a.candidates = lambda: [rec("v1")]
+SENT.clear()
+a.cycle()
+job_note = VAULT / "Jobs" / "Acme — SRE v1.md"
+text = job_note.read_text(encoding="utf-8")
+check("a fit gets a Jobs note: fit, why, status, company link", "Fit **85**/100" in text and "✅ Why: fits" in text
+      and "tags: [drafted]" in text and '"status": "drafted"' not in text and 'status: "drafted"' in text
+      and "[[Companies/Acme]]" in text and "alert sent (ref #" in text)
+ref_v1 = a.load_state()["seen"]["v1"]["ref"]
+a.record_outcome(str(ref_v1), "applied")
+text = job_note.read_text(encoding="utf-8")
+check("an outcome appends to History and keeps the summary", 'status: "applied"' in text and "Fit **85**/100" in text
+      and len(text.split("## History\n")[1].strip().splitlines()) == 2 and "status → applied" in text)
+check("the Companies note links its jobs and outcomes",
+      "[[Jobs/Acme — SRE v1]] status → applied" in (VAULT / "Companies" / "Acme.md").read_text(encoding="utf-8"))
+home = (VAULT / "Home.md").read_text(encoding="utf-8")
+check("Home shows the pipeline", "applied **1**" in home and "[[Jobs/Acme — SRE v1]] · applied" in home)
+today = (VAULT / "Activity" / f"{dt.datetime.now(vault.SGT):%Y-%m-%d}.md").read_text(encoding="utf-8")
+check("sweeps, alerts and outcomes reach the Activity log", "**sweep finished**" in today
+      and "**fit alert**" in today and "**/jobapplied**" in today)
+
+st = a.load_state()  # the state forgot the posting (pruned, restored, new id on a repost): the vault remembers
+st["seen"].pop("v1"), st["fps"].clear()
+a.save_state(st)
+a.candidates = lambda: [dict(rec("v1-repost"), title="SRE v1")]
+SENT.clear()
+judged_before = sum("--json-schema" in c for c in CALLS)
+a.cycle()
+check("a posting the vault shows as handled is not judged or alerted again",
+      not SENT and sum("--json-schema" in c for c in CALLS) == judged_before
+      and a.load_state()["seen"]["v1-repost"].get("handled") == "applied")
+
+os.environ["VAULT_DIR"] = str(job_note)  # a file, not a folder: every vault call fails
+try:
+    vault.log("x", "y")
+    vault.job("A", "B", "c", "d", status="drafted")
+    quiet = (vault.memory(["Jobs/x"]) == "" and vault.statuses() == {} and vault.mentioned("acme") == [])
+    a.candidates = lambda: [rec("v2")]
+    SENT.clear()
+    a.cycle()
+    check("vault errors never raise and never cost an alert", quiet and any("SRE v2" in s for s in SENT))
+except Exception as exc:
+    check(f"vault errors never raise ({exc!r})", False)
+os.environ.pop("VAULT_DIR")
+check("with VAULT_DIR unset the vault is off", vault.memory() == "" and vault.job("A", "B", "c") is None)
 
 failed = [label for label, ok in CHECKS if not ok]
 for label, ok in CHECKS:

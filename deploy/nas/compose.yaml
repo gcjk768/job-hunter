@@ -39,8 +39,10 @@ services:
       STALL_MIN: "120"                 # no progress this long -> the process exits and Docker restarts it
       HEAL: "1"                        # claude -p diagnoses repeated failures and applies safe fixes
       HEARTBEAT_MIN: "30"              # state-file heartbeat while idle; the healthcheck reads it
+      VAULT_DIR: /vault                # Obsidian movement log + memory (build/vault.py); unset = off
     volumes:
       - ../..:/app                       # the code runs from the clone, so `git pull` + restart updates it
+      - "/volume1/James/Obsidian/Job Hunter:/vault"   # create it as James first: mkdir -p, else Docker makes it root-owned
     healthcheck:                       # unhealthy if the heartbeat is older than 2h (it refreshes every 30m)
       test: ["CMD", "python", "-c", "import json,datetime as d,sys; s=json.load(open('build/.nas_state.json')); sys.exit((d.datetime.now()-d.datetime.fromisoformat(s['heartbeat'])).total_seconds()>7200)"]
       interval: 10m
