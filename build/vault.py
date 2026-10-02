@@ -2,7 +2,8 @@
 
 Layout under $VAULT_DIR (on the NAS: /volume1/James/Obsidian/Job Hunter, mounted at /vault):
     Home.md                    the pipeline at a glance, rebuilt on each fit, outcome and new day
-    Activity/YYYY-MM-DD.md     one line per event: - HH:MM emoji **what** · detail · [[entity]] (SGT)
+    Activity/YYYY/MM/YYYY-MM-DD.md  one line per event: - HH:MM emoji **what** · detail · [[entity]] (SGT);
+                               migrate() moves older flat Activity/YYYY-MM-DD.md notes into place at startup
     Jobs/Company — Title.md    one note per posting: fit, why, gaps, link; status in frontmatter; ## History
     Companies/Company.md       one note per company: its jobs and outcomes in ## History
 
@@ -156,7 +157,7 @@ def log(emoji: str, what: str, detail="", link: str | None = None, now: datetime
         return
     try:
         now = now or datetime.now(SGT)
-        day = base / "Activity" / f"{now:%Y-%m-%d}.md"
+        day = _day_path(base, f"{now:%Y-%m-%d}")
         parts = [f"- {now:%H:%M} {emoji} **{_one_line(what, 80)}**"]
         if detail:
             parts.append(_one_line(detail))
@@ -174,6 +175,40 @@ def log(emoji: str, what: str, detail="", link: str | None = None, now: datetime
             _home(base, now)
     except Exception as error:
         _warn(error)
+
+
+def _day_path(base: Path, day: str) -> Path:
+    """Activity/YYYY/MM/YYYY-MM-DD.md for a 'YYYY-MM-DD' stem."""
+    return base / "Activity" / day[:4] / day[5:7] / f"{day}.md"
+
+
+def _days(base: Path) -> list[Path]:
+    """Every Activity note, newest first (by name, so the folder layout does not matter)."""
+    folder = base / "Activity"
+    return sorted((p for p in folder.rglob("????-??-??.md")), key=lambda p: p.name, reverse=True) \
+        if folder.is_dir() else []
+
+
+def migrate() -> int:
+    """Move flat Activity/YYYY-MM-DD.md notes (the first layout) into Activity/YYYY/MM/. Returns how many
+    moved. Move, never delete; a note already in place wins. Never raises."""
+    base = root()
+    if not base:
+        return 0
+    moved = 0
+    try:
+        for p in sorted((base / "Activity").glob("????-??-??.md")) if (base / "Activity").is_dir() else []:
+            dest = _day_path(base, p.stem)
+            if dest.exists():
+                continue
+            _mkdir(dest.parent)
+            p.rename(dest)
+            moved += 1
+        if moved:
+            _home(base, datetime.now(SGT))
+    except Exception as error:
+        _warn(error)
+    return moved
 
 
 def _jobs(base: Path) -> list[tuple[Path, dict]]:
@@ -208,10 +243,12 @@ def _home(base: Path, now: datetime) -> None:
                     key=lambda pm: ORDER.index(pm[1]["status"]))
     fresh = sorted(((p, m) for p, m in jobs if m.get("status") == "drafted"),
                    key=lambda pm: pm[1].get("updated", ""), reverse=True)[:10]
-    days = sorted((base / "Activity").glob("*.md"), reverse=True)[:7]
+    days = _days(base)[:7]
+    month = f"{now:%Y-%m}"
     companies = sorted((base / "Companies").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:10] \
         if (base / "Companies").is_dir() else []
-    links = lambda paths, folder: "\n".join(f"- [[{folder}/{p.stem}]]" for p in paths) or "- (none yet)"  # noqa: E731
+    links = lambda paths, folder: "\n".join(  # noqa: E731
+        f"- [[{folder}/{p.relative_to(base / folder).with_suffix('').as_posix()}]]" for p in paths) or "- (none yet)"
     _write(base / "Home.md", f"""---
 tags: [active]
 updated: {now:%Y-%m-%d}
@@ -221,7 +258,7 @@ updated: {now:%Y-%m-%d}
 The NAS job watcher (@jameskoh_jobhunter_bot, James Channel → Job topic 2574). It writes what it did here
 and reads it back before each Claude call, so it knows what you applied to and never re-alerts a posting.
 
-- `Activity/` one note per day, one line per event (SGT)
+- `Activity/YYYY/MM/` one note per day, one line per event (SGT)
 - `Jobs/` one note per judged posting: fit, why, link, status history
 - `Companies/` one note per company: its postings and outcomes
 
@@ -234,7 +271,8 @@ and reads it back before each Claude call, so it knows what you applied to and n
 ## Latest fits, not applied yet
 {chr(10).join(row(p, m) for p, m in fresh) or "- (none yet)"}
 
-## Latest activity
+## Latest activity — {month}
+This month's notes live in `Activity/{month[:4]}/{month[5:]}/`.
 {links(days, "Activity")}
 
 ## Recent companies
@@ -263,7 +301,7 @@ def memory(links=(), max_chars: int = MEMORY_CHARS, days: int = MEMORY_DAYS) -> 
         return ""
     try:
         out = [t for t in (_entity_text(base, l) for l in dict.fromkeys(links)) if t]
-        for day in sorted((base / "Activity").glob("*.md"), reverse=True)[:days]:
+        for day in _days(base)[:days]:
             events = [l for l in day.read_text(encoding="utf-8", errors="replace").splitlines() if l.startswith("- ")]
             out += [f"{day.stem} {l[2:]}" for l in reversed(events)]
         text = "\n".join(out)

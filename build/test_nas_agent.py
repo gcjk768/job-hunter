@@ -810,7 +810,7 @@ VAULT = TMP / "vault"
 os.environ["VAULT_DIR"] = str(VAULT)
 at = dt.datetime(2026, 10, 2, 14, 3, tzinfo=vault.SGT)
 vault.log("🔔", "fit alert", "85/100 · ref #3", vault.job_link("ACME PTE. LTD.", "SRE"), now=at)
-day = (VAULT / "Activity" / "2026-10-02.md").read_text(encoding="utf-8")
+day = (VAULT / "Activity" / "2026" / "10" / "2026-10-02.md").read_text(encoding="utf-8")
 check("Activity line is '- HH:MM emoji **what** · detail · [[entity]]'",
       day.splitlines()[-1] == "- 14:03 🔔 **fit alert** · 85/100 · ref #3 · [[Jobs/Acme Pte. Ltd. — SRE]]")
 check("Activity notes have frontmatter and link Home", day.startswith("---\ntags: [active]\nupdated: 2026-10-02\n")
@@ -857,9 +857,19 @@ check("the Companies note links its jobs and outcomes",
       "[[Jobs/Acme — SRE v1]] status → applied" in (VAULT / "Companies" / "Acme.md").read_text(encoding="utf-8"))
 home = (VAULT / "Home.md").read_text(encoding="utf-8")
 check("Home shows the pipeline", "applied **1**" in home and "[[Jobs/Acme — SRE v1]] · applied" in home)
-today = (VAULT / "Activity" / f"{dt.datetime.now(vault.SGT):%Y-%m-%d}.md").read_text(encoding="utf-8")
+today = (VAULT / "Activity" / f"{dt.datetime.now(vault.SGT):%Y/%m/%Y-%m-%d}.md").read_text(encoding="utf-8")
 check("sweeps, alerts and outcomes reach the Activity log", "**sweep finished**" in today
       and "**fit alert**" in today and "**/jobapplied**" in today)
+check("Home links the month folder and dated notes", f"## Latest activity — {dt.datetime.now(vault.SGT):%Y-%m}" in home
+      and "[[Activity/2026/10/2026-10-02]]" in home)
+(VAULT / "Activity" / "2026-09-30.md").write_text("---\ntags: [active]\n---\n- 09:00 🔎 **old**\n", encoding="utf-8")
+(VAULT / "Activity" / "2026-10-02.md").write_text("flat duplicate\n", encoding="utf-8")
+check("migrate moves flat notes into YYYY/MM and never overwrites", vault.migrate() == 1
+      and (VAULT / "Activity" / "2026" / "09" / "2026-09-30.md").exists()
+      and not (VAULT / "Activity" / "2026-09-30.md").exists()
+      and (VAULT / "Activity" / "2026-10-02.md").exists()
+      and vault._days(VAULT)[-1].name == "2026-09-30.md"  # memory() reads it last (oldest), still in reach
+      and "2026-09-30 09:00 🔎 **old**" in vault.memory(max_chars=10 ** 6))
 
 st = a.load_state()  # the state forgot the posting (pruned, restored, new id on a repost): the vault remembers
 st["seen"].pop("v1"), st["fps"].clear()

@@ -1487,6 +1487,8 @@ def start_watchdog() -> None:
 
 def startup_checks() -> None:
     """Crash-loop back-off, and a diagnosis after a stall restart."""
+    if moved := vault.migrate():
+        print(f"  vault: moved {moved} Activity notes into Activity/YYYY/MM/")
     state = load_state()
     hour_ago = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat(timespec="seconds")
     starts = [t for t in state.get("starts") or [] if t >= hour_ago] + [_now()]

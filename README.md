@@ -142,7 +142,7 @@ Only one process may call `getUpdates` per bot token, so nothing else should pol
 ### Vault: movement log + memory
 
 With `VAULT_DIR` set (compose mounts `/volume1/James/Obsidian/Job Hunter` at `/vault`), `build/vault.py` keeps an Obsidian vault:
-`Home.md` (the pipeline at a glance), `Activity/YYYY-MM-DD.md` (one line per event, SGT: `- HH:MM emoji **what** · detail · [[entity]]` for sweeps, fit alerts, not-a-fits, outcomes, commands, self-heal), `Jobs/Company — Title.md` (fit, why, gaps, link, status in frontmatter, append-only `## History`) and `Companies/Company.md` (its postings and outcomes).
+`Home.md` (the pipeline at a glance), `Activity/YYYY/MM/YYYY-MM-DD.md` (one line per event, SGT: `- HH:MM emoji **what** · detail · [[entity]]` for sweeps, fit alerts, not-a-fits, outcomes, commands, self-heal), `Jobs/Company — Title.md` (fit, why, gaps, link, status in frontmatter, append-only `## History`) and `Companies/Company.md` (its postings and outcomes).
 
 It is read back as memory: the judge and `/jobask` prompts get a capped excerpt (about 4,000 chars: the job and company notes, then the recent log, newest first), so the model knows you already applied, were rejected or were ghosted; and a posting whose note shows it was already alerted or acted on is never judged or alerted again, even after the state file forgets it. Vault I/O is best-effort and never breaks a run or costs an alert. No secrets or prompts are written; files are mode 664, owned by `VAULT_UID`.
 
