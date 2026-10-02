@@ -24,7 +24,7 @@ are unique /job* ones; the old generic names (/status, /ask, …) are aliases in
                         message
 
 It can also read job-alert emails (LinkedIn, JobStreet, Glassdoor, Indeed) from your inbox when IMAP_* is
-set (mail_alerts.py), sweeps more often during working hours, drafts a LinkedIn outreach note for each
+set (mail_alerts.py), sweeps every hour round the clock, drafts a LinkedIn outreach note for each
 fit, reminds you to follow up FOLLOWUP_DAYS after /jobapplied, and posts a weekly digest.
 
 Reuses the sweep (weekly_sweep.collect + job_sources) and the document builder (build_docs), so the
@@ -53,7 +53,7 @@ answer. Auth comes from CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, uses the 
 ANTHROPIC_API_KEY. The verdict is enforced with --json-schema, so there is no JSON to hand-parse.
 
 Env: CLAUDE_BIN, JOB_MODEL, CLAUDE_TIMEOUT, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID, SWEEP_INTERVAL_HOURS,
-     BUSY_INTERVAL_HOURS, BUSY_HOURS, MAX_PER_CYCLE, FIT_THRESHOLD, URGENT_SCORE, HEARTBEAT_MIN,
+     FALLBACK_MODEL, MAX_PER_CYCLE, FIT_THRESHOLD, URGENT_SCORE, HEARTBEAT_MIN,
      FOLLOWUP_DAYS, DIGEST_WEEKDAY, EXTRACT_MODEL, IMAP_* (see mail_alerts.py), VAULT_DIR, VAULT_UID.
 """
 from __future__ import annotations
@@ -87,12 +87,12 @@ STATE = ROOT / "build" / ".nas_state.json"
 OUT = ROOT / "tailored-auto"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-MODEL = os.environ.get("JOB_MODEL", "sonnet")  # any `claude --model` value: sonnet, opus, haiku or a full id
+MODEL = os.environ.get("JOB_MODEL", "opus")  # any `claude --model` value: opus, sonnet, haiku or a full id
+# When JOB_MODEL fails (rate limit, overloaded, unavailable) the call is retried once on this model.
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "sonnet")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
-INTERVAL_H = float(os.environ.get("SWEEP_INTERVAL_HOURS", "6"))
-# Applying early matters, so sweep faster while recruiters are working (local time, Mon-Fri).
-BUSY_INTERVAL_H = float(os.environ.get("BUSY_INTERVAL_HOURS", "2"))
-BUSY_HOURS = tuple(int(h) for h in os.environ.get("BUSY_HOURS", "8-20").split("-"))
+# Every hour, 24/7: a new posting is worth a message at any time (James, 2026-10-02). Quiet when nothing is new.
+INTERVAL_H = float(os.environ.get("SWEEP_INTERVAL_HOURS", "1"))
 URGENT_SCORE = int(os.environ.get("URGENT_SCORE", "85"))  # alerts at or above this say "apply today"
 FOLLOWUP_DAYS = int(os.environ.get("FOLLOWUP_DAYS", "7"))
 DIGEST_WEEKDAY = int(os.environ.get("DIGEST_WEEKDAY", "6"))  # Monday=0 … Sunday=6, sent after 09:00
@@ -182,8 +182,19 @@ COST = {"usd": 0.0}  # running total for the current cycle; reset by cycle()
 
 
 def claude(prompt: str, schema: dict | None = None, model: str | None = None):
-    """One `claude -p` call. Returns the schema-validated object when `schema` is given, else the text."""
-    cmd = [CLAUDE_BIN, "-p", "--output-format", "json", "--model", model or MODEL, "--tools", "",
+    """One `claude -p` call. Returns the schema-validated object when `schema` is given, else the text.
+    A call on the main model that fails at the CLI level is retried once on FALLBACK_MODEL."""
+    try:
+        return _claude(prompt, schema, model or MODEL)
+    except ClaudeError as exc:
+        if model not in (None, MODEL) or MODEL == FALLBACK_MODEL:
+            raise
+        print(f"  ! {MODEL} failed ({str(exc)[:120]}); retrying on {FALLBACK_MODEL}")
+        return _claude(prompt, schema, FALLBACK_MODEL)
+
+
+def _claude(prompt: str, schema: dict | None, model: str):
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "json", "--model", model, "--tools", "",
            "--no-session-persistence", "--strict-mcp-config", "--setting-sources", ""]
     if schema:
         cmd += ["--json-schema", json.dumps(schema)]
@@ -542,7 +553,7 @@ def cycle() -> None:
         telegram(f"{head('online', 'on the NAS')}\n\n"
                  f"🗂 <b>Baseline</b> · {len(jobs)} current postings\n"
                  f"🔔 I'll message you when something new fits\n"
-                 f"⏰ Every {BUSY_INTERVAL_H:g}h in working hours, {INTERVAL_H:g}h otherwise")
+                 f"⏰ Every {INTERVAL_H:g}h, round the clock")
         return
 
     new = [r for r in jobs if ident(r) not in seen]
@@ -1012,9 +1023,8 @@ def status_text(state: dict) -> str:
     runs = state.get("runs") or []
     blocks = [head("status", "job watcher"),
               f"💓 <b>Heartbeat</b> · {_age(state.get('heartbeat'))}\n"
-              f"🔎 <b>Last sweep</b> · {_age(state.get('last_cycle'))} (every {interval_now():g}h now; "
-              f"{BUSY_INTERVAL_H:g}h weekdays {BUSY_HOURS[0]}-{BUSY_HOURS[1]}h, else {INTERVAL_H:g}h)\n"
-              f"🤖 <b>Model</b> · {esc(MODEL)} via claude -p ({esc(claude_ok())})\n"
+              f"🔎 <b>Last sweep</b> · {_age(state.get('last_cycle'))} (every {interval_now():g}h now, 24/7)\n"
+              f"🤖 <b>Model</b> · {esc(MODEL)} via claude -p, {esc(FALLBACK_MODEL)} fallback ({esc(claude_ok())})\n"
               f"📦 <b>Code</b> · <code>{esc(code_version())}</code>\n"
               f"🗂 <b>Postings tracked</b> · {len(state.get('seen', {}))}"]
     if state.get("last_error"):
@@ -1304,9 +1314,8 @@ def due_in(state: dict) -> float:
 
 
 def interval_now(now: dt.datetime | None = None) -> float:
-    now = now or dt.datetime.now()
-    busy = now.weekday() < 5 and BUSY_HOURS[0] <= now.hour < BUSY_HOURS[1]
-    return BUSY_INTERVAL_H if busy else INTERVAL_H
+    """Hours between sweeps. One value, any hour of any day: no quiet hours, no working-hours window."""
+    return INTERVAL_H
 
 
 def selfcheck() -> str:
@@ -1598,7 +1607,7 @@ def heal(trigger: str, error: str, force: bool = False, thread=None) -> bool:
     except Exception as exc:
         check = f"(self-check failed: {exc})"
     usage = shutil.disk_usage(STATE.parent)
-    settings = {k: os.environ.get(k) for k in ("JOB_MODEL", "SWEEP_INTERVAL_HOURS", "BUSY_INTERVAL_HOURS",
+    settings = {k: os.environ.get(k) for k in ("JOB_MODEL", "FALLBACK_MODEL", "SWEEP_INTERVAL_HOURS",
                                                "MAX_PER_CYCLE", "FIT_THRESHOLD", "CLAUDE_TIMEOUT") if os.environ.get(k)}
     try:
         got = claude(HEAL_PROMPT.format(

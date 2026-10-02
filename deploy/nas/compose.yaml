@@ -1,5 +1,5 @@
 # Job watcher on the UGREEN NAS — UGOS Docker project `job-hunter`, share docker/job-hunter.
-# Sweeps every SWEEP_INTERVAL_HOURS, judges new postings with Claude through the Claude Code CLI
+# Sweeps every SWEEP_INTERVAL_HOURS (1, round the clock), judges new postings with Claude through the Claude Code CLI
 # (`claude -p`, tools disabled), drafts resume + cover letter into ./tailored-auto/, and posts to
 # Telegram. Never applies.
 #
@@ -27,10 +27,9 @@ services:
     environment:
       TZ: Asia/Singapore
       PYTHONUNBUFFERED: "1"
-      JOB_MODEL: sonnet                # any `claude --model` value: haiku is cheaper, opus is stronger
-      SWEEP_INTERVAL_HOURS: "6"          # nights and weekends
-      BUSY_INTERVAL_HOURS: "2"           # Mon-Fri during BUSY_HOURS: apply early
-      BUSY_HOURS: "8-20"
+      JOB_MODEL: opus                  # judges fit and drafts; any `claude --model` value
+      FALLBACK_MODEL: sonnet           # used for one retry when JOB_MODEL fails (rate limit, overloaded)
+      SWEEP_INTERVAL_HOURS: "1"        # every hour, 24/7; a message only when a new posting fits
       MAX_PER_CYCLE: "8"               # caps Claude usage per cycle
       FIT_THRESHOLD: "70"
       URGENT_SCORE: "85"               # alerts at or above this say "apply today"

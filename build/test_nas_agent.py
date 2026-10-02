@@ -351,9 +351,26 @@ check("a failing follow-up draft still nudges, once, without retrying every loop
       sum("⏰" in s for s in SENT) == 1 and any("couldn't draft one" in s for s in SENT))
 
 # --- sweep cadence --------------------------------------------------------------------------------
-check("weekday working hours use the busy interval", a.interval_now(monday10) == a.BUSY_INTERVAL_H)
-check("evenings use the normal interval", a.interval_now(monday10.replace(hour=22)) == a.INTERVAL_H)
-check("weekends use the normal interval", a.interval_now(sunday10) == a.INTERVAL_H)
+check("one hourly interval at any hour of any day (no quiet hours)",
+      a.interval_now(monday10) == a.interval_now(monday10.replace(hour=3)) == a.interval_now(sunday10)
+      == a.INTERVAL_H == 1.0)
+
+# --- model fallback -------------------------------------------------------------------------------
+CALLS = []
+a.subprocess.run = lambda cmd, **kw: (CALLS.append(cmd[cmd.index("--model") + 1]),
+                                      subprocess.CompletedProcess(cmd, 1, "", "overloaded") if CALLS[-1] == a.MODEL
+                                      else subprocess.CompletedProcess(cmd, 0, json.dumps(
+                                          {"subtype": "success", "result": "fine"}), ""))[1]
+check("a failed opus call is retried once on the fallback model",
+      a.claude("hi") == "fine" and CALLS == [a.MODEL, a.FALLBACK_MODEL] and a.MODEL == "opus" and a.FALLBACK_MODEL == "sonnet")
+CALLS.clear()
+try:
+    a.claude("hi", model=a.EXTRACT_MODEL)
+    extract_ok = True
+except a.ClaudeError:
+    extract_ok = False
+check("explicit cheap-model calls never fall back", extract_ok and CALLS == [a.EXTRACT_MODEL])
+a.subprocess.run = fake_run
 
 # --- job-alert emails -----------------------------------------------------------------------------
 import mail_alerts  # noqa: E402

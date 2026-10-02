@@ -23,7 +23,7 @@ The infra roles I want are scattered. Some are on MyCareersFuture. Others appear
 - **Deterministic filters run before the LLM.** Regexes cut role shape, seniority, pay floor, excluded employers and public-sector/defence work before a single token is spent (`build/weekly_sweep.py`). The model only sees candidates that already pass. That keeps cost down and makes the hard rules auditable.
 - **Cost is capped and nothing gets lost.** `MAX_PER_CYCLE` (default 8) limits LLM calls per cycle. Postings over the cap, and any whose judge call fails, stay *unseen* and are retried next cycle rather than dropped. The first run only records a baseline, so turning it on doesn't flood you with every live posting.
 - **Coverage beyond scraping, without scraping.** LinkedIn, JobStreet, Glassdoor and Indeed stay login-walled to a crawler. Share a job from their app to the bot and it's judged like any other posting; when the page is login-walled, the bot asks you to paste the description and judges your next message against that link. Optionally, with `IMAP_*` set, the watcher also reads their alert emails read-only (`BODY.PEEK`, nothing marked read), has a cheap model (`EXTRACT_MODEL`, default `haiku`) list the postings in each, and runs them through the same regex filters and judge (`build/mail_alerts.py`).
-- **Built to get a reply, not just a draft.** Each fit comes with who to contact (likely hiring-manager titles plus a LinkedIn people-search link) and a ≤280-character connection note, also saved as `outreach.md`. Scores ≥ `URGENT_SCORE` are flagged "🔥 APPLY TODAY", and sweeps run every `BUSY_INTERVAL_HOURS` (2h) during weekday working hours so you see postings early.
+- **Built to get a reply, not just a draft.** Each fit comes with who to contact (likely hiring-manager titles plus a LinkedIn people-search link) and a ≤280-character connection note, also saved as `outreach.md`. Scores ≥ `URGENT_SCORE` are flagged "🔥 APPLY TODAY", and sweeps run every `SWEEP_INTERVAL_HOURS` (1h) round the clock, so a new fit reaches you within the hour, day or night.
 - **Outcomes close the loop.** Every fit gets a ref number. `/jobapplied 12`, `/jobinterview 12`, `/jobrejected 12`… record what happened; `FOLLOWUP_DAYS` after `/jobapplied` with no update you get a nudge with a drafted follow-up email; `/jobinterview` builds a prep pack; a Sunday digest reports reply rate by source and whether `FIT_THRESHOLD` looks miscalibrated.
 - **Every draft is fact-checked.** Before a fit is drafted, a second `claude -p` pass compares the tagline, summary, cover letter and outreach note with the resume and removes any claim it doesn't support (a wrong year, tool, certification or employer). The alert says how many claims it corrected and `fit.md` lists them; if the check itself fails, the alert says the draft is unchecked (`FACTCHECK=0` turns it off).
 - **Judged on the real job description where one exists.** MyCareersFuture via its API, Greenhouse via its per-job endpoint, and Ashby and Lever from the description their board API already returns. Only Apple and alert-email postings are judged on title, company and whatever snippet came with them.
@@ -89,15 +89,14 @@ Environment (put the secrets in `.env`, which is never committed):
 | Variable | Default | Purpose |
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | Claude login for the container (`claude setup-token`); or set `ANTHROPIC_API_KEY` |
-| `JOB_MODEL` | `sonnet` | Any `claude --model` value (`haiku`, `sonnet`, `opus` or a full model ID) |
+| `JOB_MODEL` | `opus` | Any `claude --model` value (`haiku`, `sonnet`, `opus` or a full model ID) |
+| `FALLBACK_MODEL` | `sonnet` | One retry on this model when a `JOB_MODEL` call fails (rate limit, overloaded) |
 | `CLAUDE_BIN` | `claude` | Path to the CLI |
 | `CLAUDE_TIMEOUT` | `300` | Seconds per `claude -p` call |
 | `TELEGRAM_BOT_TOKEN` | — | Bot token (if unset, alerts are printed to stdout instead) |
 | `TELEGRAM_CHAT_ID` | — | Target chat |
 | `TELEGRAM_THREAD_ID` | — | Optional forum topic. When set, the bot posts there and answers only messages in that topic (a shared group's other topics belong to other bots) |
-| `SWEEP_INTERVAL_HOURS` | `6` | Loop interval outside working hours |
-| `BUSY_INTERVAL_HOURS` | `2` | Loop interval Mon–Fri during `BUSY_HOURS` |
-| `BUSY_HOURS` | `8-20` | Local working hours for the faster interval |
+| `SWEEP_INTERVAL_HOURS` | `1` | Loop interval, every hour of every day (no quiet hours) |
 | `URGENT_SCORE` | `85` | Alerts at or above this say "🔥 APPLY TODAY" |
 | `FOLLOWUP_DAYS` | `7` | Days after `/jobapplied` before a follow-up nudge |
 | `DIGEST_WEEKDAY` | `6` | Day for the weekly digest (Monday=0, Sunday=6), after 09:00 |
